@@ -37,6 +37,7 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
   this->kf_pose_pub  = this->nh.advertise<geometry_msgs::PoseArray>("kf_pose", 1, true);
   this->kf_cloud_pub = this->nh.advertise<sensor_msgs::PointCloud2>("kf_cloud", 1, true);
   this->deskewed_pub = this->nh.advertise<sensor_msgs::PointCloud2>("deskewed", 1, true);
+  this->optmap_pc_pub= this->nh.advertise<sensor_msgs::PointCloud2>("optmap_pointcloud", 1, true);
 
   this->pose_optmap_pub = this->nh.advertise<direct_lidar_inertial_odometry::OptmapPose>("pose_optmap", 1000, true);
   this->curr_deskewed_seq = 0;
@@ -447,8 +448,14 @@ void dlio::OdomNode::publishCloud(pcl::PointCloud<PointType>::ConstPtr published
   }
 
   pcl::PointCloud<PointType>::Ptr deskewed_scan_t_ (boost::make_shared<pcl::PointCloud<PointType>>());
+  pcl::PointCloud<PointType>::Ptr local_deskewed_scan_t_ (boost::make_shared<pcl::PointCloud<PointType>>());
+
+  Eigen::Matrix4f Tc = Eigen::Matrix4f::Identity();
+  Tc.block(0, 3, 3, 1) = this->state.p;
+  Tc.block(0, 0, 3, 3) = this->state.q.toRotationMatrix();
 
   pcl::transformPointCloud (*published_cloud, *deskewed_scan_t_, T_cloud);
+  pcl::transformPointCloud (*deskewed_scan_t_, *local_deskewed_scan_t_, Tc.inverse());
 
   // published deskewed cloud
   sensor_msgs::PointCloud2 deskewed_ros;
@@ -456,6 +463,12 @@ void dlio::OdomNode::publishCloud(pcl::PointCloud<PointType>::ConstPtr published
   deskewed_ros.header.stamp = this->scan_header_stamp;
   deskewed_ros.header.frame_id = this->odom_frame;
   this->deskewed_pub.publish(deskewed_ros);
+
+  sensor_msgs::PointCloud2 optmap_pc;
+  pcl::toROSMsg(*local_deskewed_scan_t_, optmap_pc);
+  optmap_pc.header.stamp = this->scan_header_stamp;
+  optmap_pc.header.seq = this->curr_deskewed_seq;
+  this->optmap_pc_pub.publish(optmap_pc);
 
   this->curr_deskewed_seq++;
 
