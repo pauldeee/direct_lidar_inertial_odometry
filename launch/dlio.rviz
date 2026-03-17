@@ -60,7 +60,7 @@ Visualization Manager:
           Length: 1
           Name: odom
           Radius: 0.25
-          Reference Frame: robot/odom
+          Reference Frame: aquila/odom
           Show Trail: false
           Value: true
         - Alpha: 1
@@ -69,7 +69,7 @@ Visualization Manager:
           Length: 1
           Name: base_link
           Radius: 0.25
-          Reference Frame: robot/base_link
+          Reference Frame: aquila/base_link
           Show Trail: false
           Value: true
       Enabled: true
@@ -101,7 +101,7 @@ Visualization Manager:
           Size (Pixels): 2
           Size (m): 0.009999999776482582
           Style: Points
-          Topic: /robot/dlio/odom_node/pointcloud/deskewed
+          Topic: /aquila/dlio/odom_node/pointcloud/deskewed
           Unreliable: false
           Use Fixed Frame: true
           Use rainbow: true
@@ -131,7 +131,7 @@ Visualization Manager:
           Size (Pixels): 1
           Size (m): 0.009999999776482582
           Style: Points
-          Topic: /robot/dlio/odom_node/pointcloud/deskewed
+          Topic: /aquila/dlio/odom_node/pointcloud/deskewed
           Unreliable: false
           Use Fixed Frame: true
           Use rainbow: true
@@ -161,7 +161,7 @@ Visualization Manager:
           Size (Pixels): 1
           Size (m): 0.05000000074505806
           Style: Points
-          Topic: /robot/dlio/map_node/map
+          Topic: /aquila/dlio/map_node/map
           Unreliable: false
           Use Fixed Frame: true
           Use rainbow: true
@@ -202,7 +202,7 @@ Visualization Manager:
             Shaft Length: 1
             Shaft Radius: 0.05000000074505806
             Value: Axes
-          Topic: /robot/dlio/odom_node/odom
+          Topic: /aquila/dlio/odom_node/odom
           Unreliable: false
           Value: false
         - Alpha: 1
@@ -219,7 +219,7 @@ Visualization Manager:
           Shaft Length: 0.23000000417232513
           Shaft Radius: 0.009999999776482582
           Shape: Axes
-          Topic: /robot/dlio/odom_node/keyframes
+          Topic: /aquila/dlio/odom_node/keyframes
           Unreliable: false
           Value: false
         - Alpha: 1
@@ -243,7 +243,7 @@ Visualization Manager:
           Radius: 0.029999999329447746
           Shaft Diameter: 0.10000000149011612
           Shaft Length: 0.10000000149011612
-          Topic: /robot/dlio/odom_node/path
+          Topic: /aquila/dlio/odom_node/path
           Unreliable: false
           Value: true
       Enabled: true
@@ -252,7 +252,7 @@ Visualization Manager:
   Global Options:
     Background Color: 0; 0; 0
     Default Light: true
-    Fixed Frame: robot/odom
+    Fixed Frame: aquila/odom
     Frame Rate: 30
   Name: root
   Tools:
@@ -293,7 +293,7 @@ Visualization Manager:
       Name: Current View
       Near Clip Distance: 0.009999999776482582
       Pitch: 1
-      Target Frame: robot/base_link
+      Target Frame: aquila/base_link
       Yaw: 3.140000104904175
     Saved: ~
 Window Geometry:
