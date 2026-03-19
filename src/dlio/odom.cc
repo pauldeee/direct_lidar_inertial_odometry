@@ -222,31 +222,31 @@ void dlio::OdomNode::getParams() {
   std::vector<float> R_default{1., 0., 0., 0., 1., 0., 0., 0., 1.};
 
   // center of gravity to imu
-  std::vector<float> baselink2imu_t, baselink2imu_R;
-  ros::param::param<std::vector<float>>("~dlio/extrinsics/baselink2imu/t", baselink2imu_t, t_default);
-  ros::param::param<std::vector<float>>("~dlio/extrinsics/baselink2imu/R", baselink2imu_R, R_default);
-  this->extrinsics.baselink2imu.t =
-    Eigen::Vector3f(baselink2imu_t[0], baselink2imu_t[1], baselink2imu_t[2]);
-  this->extrinsics.baselink2imu.R =
-    Eigen::Map<const Eigen::Matrix<float, -1, -1, Eigen::RowMajor>>(baselink2imu_R.data(), 3, 3);
+  std::vector<float> imu2baselink_t, imu2baselink_R;
+  ros::param::param<std::vector<float>>("~dlio/extrinsics/imu2baselink/t", imu2baselink_t, t_default);
+  ros::param::param<std::vector<float>>("~dlio/extrinsics/imu2baselink/R", imu2baselink_R, R_default);
+  this->extrinsics.imu2baselink.t =
+    Eigen::Vector3f(imu2baselink_t[0], imu2baselink_t[1], imu2baselink_t[2]);
+  this->extrinsics.imu2baselink.R =
+    Eigen::Map<const Eigen::Matrix<float, -1, -1, Eigen::RowMajor>>(imu2baselink_R.data(), 3, 3);
 
-  this->extrinsics.baselink2imu_T = Eigen::Matrix4f::Identity();
-  this->extrinsics.baselink2imu_T.block(0, 3, 3, 1) = this->extrinsics.baselink2imu.t;
-  this->extrinsics.baselink2imu_T.block(0, 0, 3, 3) = this->extrinsics.baselink2imu.R;
+  this->extrinsics.imu2baselink_T = Eigen::Matrix4f::Identity();
+  this->extrinsics.imu2baselink_T.block(0, 3, 3, 1) = this->extrinsics.imu2baselink.t;
+  this->extrinsics.imu2baselink_T.block(0, 0, 3, 3) = this->extrinsics.imu2baselink.R;
 
   // center of gravity to lidar
-  std::vector<float> baselink2lidar_t, baselink2lidar_R;
-  ros::param::param<std::vector<float>>("~dlio/extrinsics/baselink2lidar/t", baselink2lidar_t, t_default);
-  ros::param::param<std::vector<float>>("~dlio/extrinsics/baselink2lidar/R", baselink2lidar_R, R_default);
+  std::vector<float> lidar2baselink_t, lidar2baselink_R;
+  ros::param::param<std::vector<float>>("~dlio/extrinsics/lidar2baselink/t", lidar2baselink_t, t_default);
+  ros::param::param<std::vector<float>>("~dlio/extrinsics/lidar2baselink/R", lidar2baselink_R, R_default);
 
-  this->extrinsics.baselink2lidar.t =
-    Eigen::Vector3f(baselink2lidar_t[0], baselink2lidar_t[1], baselink2lidar_t[2]);
-  this->extrinsics.baselink2lidar.R =
-    Eigen::Map<const Eigen::Matrix<float, -1, -1, Eigen::RowMajor>>(baselink2lidar_R.data(), 3, 3);
+  this->extrinsics.lidar2baselink.t =
+    Eigen::Vector3f(lidar2baselink_t[0], lidar2baselink_t[1], lidar2baselink_t[2]);
+  this->extrinsics.lidar2baselink.R =
+    Eigen::Map<const Eigen::Matrix<float, -1, -1, Eigen::RowMajor>>(lidar2baselink_R.data(), 3, 3);
 
-  this->extrinsics.baselink2lidar_T = Eigen::Matrix4f::Identity();
-  this->extrinsics.baselink2lidar_T.block(0, 3, 3, 1) = this->extrinsics.baselink2lidar.t;
-  this->extrinsics.baselink2lidar_T.block(0, 0, 3, 3) = this->extrinsics.baselink2lidar.R;
+  this->extrinsics.lidar2baselink_T = Eigen::Matrix4f::Identity();
+  this->extrinsics.lidar2baselink_T.block(0, 3, 3, 1) = this->extrinsics.lidar2baselink.t;
+  this->extrinsics.lidar2baselink_T.block(0, 0, 3, 3) = this->extrinsics.lidar2baselink.R;
 
   // IMU
   ros::param::param<bool>("~dlio/odom/imu/calibration/accel", this->calibrate_accel_, true);
@@ -421,11 +421,11 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   transformStamped.header.frame_id = this->baselink_frame;
   transformStamped.child_frame_id = this->imu_frame;
 
-  transformStamped.transform.translation.x = this->extrinsics.baselink2imu.t[0];
-  transformStamped.transform.translation.y = this->extrinsics.baselink2imu.t[1];
-  transformStamped.transform.translation.z = this->extrinsics.baselink2imu.t[2];
+  transformStamped.transform.translation.x = this->extrinsics.imu2baselink.t[0];
+  transformStamped.transform.translation.y = this->extrinsics.imu2baselink.t[1];
+  transformStamped.transform.translation.z = this->extrinsics.imu2baselink.t[2];
 
-  Eigen::Quaternionf q(this->extrinsics.baselink2imu.R);
+  Eigen::Quaternionf q(this->extrinsics.imu2baselink.R);
   transformStamped.transform.rotation.w = q.w();
   transformStamped.transform.rotation.x = q.x();
   transformStamped.transform.rotation.y = q.y();
@@ -438,11 +438,11 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   transformStamped.header.frame_id = this->baselink_frame;
   transformStamped.child_frame_id = this->lidar_frame;
 
-  transformStamped.transform.translation.x = this->extrinsics.baselink2lidar.t[0];
-  transformStamped.transform.translation.y = this->extrinsics.baselink2lidar.t[1];
-  transformStamped.transform.translation.z = this->extrinsics.baselink2lidar.t[2];
+  transformStamped.transform.translation.x = this->extrinsics.lidar2baselink.t[0];
+  transformStamped.transform.translation.y = this->extrinsics.lidar2baselink.t[1];
+  transformStamped.transform.translation.z = this->extrinsics.lidar2baselink.t[2];
 
-  Eigen::Quaternionf qq(this->extrinsics.baselink2lidar.R);
+  Eigen::Quaternionf qq(this->extrinsics.lidar2baselink.R);
   transformStamped.transform.rotation.w = qq.w();
   transformStamped.transform.rotation.x = qq.x();
   transformStamped.transform.rotation.y = qq.y();
@@ -591,7 +591,7 @@ void dlio::OdomNode::preprocessPoints() {
 
     pcl::PointCloud<PointType>::Ptr deskewed_scan_ (boost::make_shared<pcl::PointCloud<PointType>>());
     pcl::transformPointCloud (*this->original_scan, *deskewed_scan_,
-                              this->T_prior * this->extrinsics.baselink2lidar_T);
+                              this->T_prior * this->extrinsics.lidar2baselink_T);
     this->deskewed_scan = deskewed_scan_;
     this->deskew_status = false;
   }
@@ -700,7 +700,7 @@ void dlio::OdomNode::deskewPointcloud() {
 
     this->first_valid_scan = true;
     this->T_prior = this->T; // assume no motion for the first scan
-    pcl::transformPointCloud (*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
+    pcl::transformPointCloud (*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.lidar2baselink_T);
     this->deskewed_scan = deskewed_scan_;
     this->deskew_status = true;
     return;
@@ -718,7 +718,7 @@ void dlio::OdomNode::deskewPointcloud() {
     ROS_FATAL("Bad time sync between LiDAR and IMU!");
 
     this->T_prior = this->T;
-    pcl::transformPointCloud (*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
+    pcl::transformPointCloud (*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.lidar2baselink_T);
     this->deskewed_scan = deskewed_scan_;
     this->deskew_status = false;
     return;
@@ -730,7 +730,7 @@ void dlio::OdomNode::deskewPointcloud() {
 #pragma omp parallel for num_threads(this->num_threads_)
   for (int i = 0; i < timestamps.size(); i++) {
 
-    Eigen::Matrix4f T = frames[i] * this->extrinsics.baselink2lidar_T;
+    Eigen::Matrix4f T = frames[i] * this->extrinsics.lidar2baselink_T;
 
     // transform point to world frame
     for (int k = unique_time_indices[i]; k < unique_time_indices[i+1]; k++) {
@@ -1421,7 +1421,7 @@ sensor_msgs::Imu::Ptr dlio::OdomNode::transformImu(const sensor_msgs::Imu::Const
                           imu_raw->angular_velocity.y,
                           imu_raw->angular_velocity.z);
 
-  Eigen::Vector3f ang_vel_cg = this->extrinsics.baselink2imu.R * ang_vel;
+  Eigen::Vector3f ang_vel_cg = this->extrinsics.imu2baselink.R * ang_vel;
 
   imu->angular_velocity.x = ang_vel_cg[0];
   imu->angular_velocity.y = ang_vel_cg[1];
@@ -1440,11 +1440,11 @@ sensor_msgs::Imu::Ptr dlio::OdomNode::transformImu(const sensor_msgs::Imu::Const
     scale = this->gravity_;
   }
 
-  Eigen::Vector3f lin_accel_cg = scale * this->extrinsics.baselink2imu.R * lin_accel;
+  Eigen::Vector3f lin_accel_cg = scale * this->extrinsics.imu2baselink.R * lin_accel;
 
   lin_accel_cg = lin_accel_cg
-                 + ((ang_vel_cg - ang_vel_cg_prev) / dt).cross(-this->extrinsics.baselink2imu.t)
-                 + ang_vel_cg.cross(ang_vel_cg.cross(-this->extrinsics.baselink2imu.t));
+                 + ((ang_vel_cg - ang_vel_cg_prev) / dt).cross(-this->extrinsics.imu2baselink.t)
+                 + ang_vel_cg.cross(ang_vel_cg.cross(-this->extrinsics.imu2baselink.t));
 
   ang_vel_cg_prev = ang_vel_cg;
 

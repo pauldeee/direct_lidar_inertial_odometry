@@ -34,12 +34,12 @@ dlio:
         bias: [ 0.0, 0.0, 0.0 ]
 
   extrinsics:
-    baselink2imu:
+    imu2baselink:
       t: [ 0.006253, -0.011775, 0.007645 ]
       R: [ 1.,  0.,  0.,
            0.,  1.,  0.,
            0.,  0.,  1. ]
-    baselink2lidar:
+    lidar2baselink:
       t: [ 0.,  0.,  0. ]
       R: [ 1.,  0.,  0.,
            0.,  1.,  0.,
