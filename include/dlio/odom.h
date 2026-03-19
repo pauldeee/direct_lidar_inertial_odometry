@@ -222,6 +222,10 @@ private:
   std::mutex mtx_imu;
   std::condition_variable cv_imu_stamp;
 
+  bool initial_pose_use_;
+  Eigen::Vector3f initial_position_;
+  Eigen::Quaternionf initial_orientation_;
+
   static bool comparatorImu(ImuMeas m1, ImuMeas m2) {
     return (m1.stamp < m2.stamp);
   };

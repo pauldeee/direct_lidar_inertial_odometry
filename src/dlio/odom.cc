@@ -282,6 +282,21 @@ void dlio::OdomNode::getParams() {
     this->imu_accel_sm_ = Eigen::Matrix3f::Identity();
   }
 
+  // Initial Position
+  ros::param::param<bool>("~dlio/odom/initialPose/use", this->initial_pose_use_, false);
+
+  double px, py, pz, qx, qy, qz, qw;
+  ros::param::param<double>("~dlio/odom/initialPose/position/x", px, 0.0);
+  ros::param::param<double>("~dlio/odom/initialPose/position/y", py, 0.0);
+  ros::param::param<double>("~dlio/odom/initialPose/position/z", pz, 0.0);
+  ros::param::param<double>("~dlio/odom/initialPose/orientation/w", qw, 1.0);
+  ros::param::param<double>("~dlio/odom/initialPose/orientation/x", qx, 0.0);
+  ros::param::param<double>("~dlio/odom/initialPose/orientation/y", qy, 0.0);
+  ros::param::param<double>("~dlio/odom/initialPose/orientation/z", qz, 0.0);
+  this->initial_position_ = Eigen::Vector3f(px, py, pz);
+  this->initial_orientation_ = Eigen::Quaternionf(qw, qx, qy, qz);
+  this->initial_orientation_.normalize();
+
   // GICP
   ros::param::param<int>("~dlio/odom/gicp/minNumPoints", this->gicp_min_num_points_, 100);
   ros::param::param<int>("~dlio/odom/gicp/kCorrespondences", this->gicp_k_correspondences_, 20);
@@ -752,6 +767,25 @@ void dlio::OdomNode::initializeDLIO() {
   // Wait for IMU
   if (!this->first_imu_received || !this->imu_calibrated) {
     return;
+  }
+
+  // Use initial known pose
+  if (this->initial_pose_use_) {
+    std::cout << "Setting known initial pose... "; std::cout.flush();
+
+    // this->state.stamp = this->imu_meas.stamp;
+    // set known position
+    this->state.p = this->initial_position_;
+    this->T.block(0,3,3,1) = this->state.p;
+    this->lidarPose.p = this->state.p;
+
+    if (!this->gravity_align_) {
+      // set known orientation
+      this->state.q = this->initial_orientation_;
+      this->T.block(0,0,3,3) = this->state.q.toRotationMatrix();
+      this->lidarPose.q = this->state.q;
+    }
+    std::cout << "Done setting known initial pose" << std::endl << std::endl;
   }
 
   this->dlio_initialized = true;

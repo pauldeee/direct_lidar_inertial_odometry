@@ -30,6 +30,18 @@ dlio:
     gravity: 9.80665
     computeTimeOffset: true
 
+    initialPose:
+      use: true
+      position:
+        x: 3.962
+        y: -3.466
+        z: 0.850
+      orientation:
+        w: 0.0
+        x: 0.0
+        y: 0.0
+        z: 1.0
+
     imu:
       approximateGravity: true
       calibration:
