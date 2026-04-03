@@ -257,7 +257,7 @@ void dlio::OdomNode::getParams() {
   std::vector<float> accel_default{0., 0., 0.}; std::vector<float> prior_accel_bias;
   std::vector<float> gyro_default{0., 0., 0.}; std::vector<float> prior_gyro_bias;
 
-  ros::param::param<bool>("~dlio/odom/imu/approximateGravity", this->gravity_align_, true);
+  ros::param::param<bool>("~dlio/odom/imu/gravityAlign", this->gravity_align_, true);
   ros::param::param<bool>("~dlio/imu/calibration", this->imu_calibrate_, true);
   ros::param::param<std::vector<float>>("~dlio/imu/intrinsics/accel/bias", prior_accel_bias, accel_default);
   ros::param::param<std::vector<float>>("~dlio/imu/intrinsics/gyro/bias", prior_gyro_bias, gyro_default);
