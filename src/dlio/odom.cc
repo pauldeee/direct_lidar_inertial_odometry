@@ -12,6 +12,28 @@
 
 #include "dlio/odom.h"
 
+// Local point type mirroring the ouster_ros PointXYZIRT layout, used only when
+// reading incoming Ouster clouds so we can grab reflectivity and ring without
+// adding them to dlio::Point's hot-path representation.
+namespace dlio_ouster {
+  struct EIGEN_ALIGN16 Point {
+    PCL_ADD_POINT4D;
+    float intensity;
+    std::uint32_t t;
+    std::uint16_t reflectivity;
+    std::uint16_t ring;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  };
+}
+POINT_CLOUD_REGISTER_POINT_STRUCT(dlio_ouster::Point,
+                                  (float, x, x)
+                                  (float, y, y)
+                                  (float, z, z)
+                                  (float, intensity, intensity)
+                                  (std::uint32_t, t, t)
+                                  (std::uint16_t, reflectivity, reflectivity)
+                                  (std::uint16_t, ring, ring))
+
 dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
 
   this->getParams();
@@ -495,8 +517,39 @@ void dlio::OdomNode::publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen:
 
 void dlio::OdomNode::getScanFromROS(const sensor_msgs::PointCloud2ConstPtr& pc) {
 
+  // Pre-scan fields so we can route Ouster clouds through a native point type
+  // that exposes reflectivity (mapped into intensity) alongside ring.
+  bool is_ouster = false;
+  for (const auto &field : pc->fields) {
+    if (field.name == "t") { is_ouster = true; break; }
+  }
+
   pcl::PointCloud<PointType>::Ptr original_scan_ (boost::make_shared<pcl::PointCloud<PointType>>());
-  pcl::fromROSMsg(*pc, *original_scan_);
+
+  if (is_ouster) {
+    pcl::PointCloud<dlio_ouster::Point> ouster_scan;
+    pcl::fromROSMsg(*pc, ouster_scan);
+
+    original_scan_->header = ouster_scan.header;
+    original_scan_->height = ouster_scan.height;
+    original_scan_->width = ouster_scan.width;
+    original_scan_->is_dense = ouster_scan.is_dense;
+    original_scan_->points.resize(ouster_scan.points.size());
+    for (size_t i = 0; i < ouster_scan.points.size(); ++i) {
+      const auto& src = ouster_scan.points[i];
+      auto& dst = original_scan_->points[i];
+      dst.x = src.x;
+      dst.y = src.y;
+      dst.z = src.z;
+      dst.intensity = static_cast<float>(src.reflectivity);
+      dst.t = src.t;
+      dst.ring = src.ring;
+    }
+  } else {
+    // PCL fills matching named fields (xyz, intensity, time/timestamp, and ring
+    // when the source provides it — e.g. Velodyne, Hesai).
+    pcl::fromROSMsg(*pc, *original_scan_);
+  }
 
   // Remove NaNs
   std::vector<int> idx;
