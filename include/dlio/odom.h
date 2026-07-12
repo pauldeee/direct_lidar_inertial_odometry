@@ -11,6 +11,9 @@
  ***********************************************************/
 
 #include "dlio/dlio.h"
+#include <ros/callback_queue.h>
+#include <ros/subscribe_options.h>
+#include <memory>
 
 class dlio::OdomNode {
 
@@ -31,7 +34,8 @@ private:
   void callbackPointCloud(const sensor_msgs::PointCloud2ConstPtr& pc);
   void callbackImu(const sensor_msgs::Imu::ConstPtr& imu);
 
-  void publishPose(const ros::TimerEvent& e);
+  void publishPose();  // per-scan corrected pose, stamped scan_stamp (MEDIAN)
+  void publishHighRateInterval();  // dense IMU-rate poses for the just-finished scan interval
 
   void publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
   void publishCloud(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
@@ -60,7 +64,8 @@ private:
                          boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it);
   void propagateGICP();
 
-  void propagateState();
+  void propagateState(const ImuMeas& m);
+  void propagateStateScanWindow();
   void updateState();
 
   void setAdaptiveParams();
@@ -88,6 +93,17 @@ private:
   // Subscribers
   ros::Subscriber lidar_sub;
   ros::Subscriber imu_sub;
+
+  // Dedicated single-threaded callback queue + spinner for the lidar subscriber.
+  // callbackPointCloud is NOT re-entrant (it mutates shared scan/keyframe state),
+  // so a DEEP pointcloud queue spun by the node's multi-threaded AsyncSpinner(0)
+  // would run it CONCURRENTLY under lag and corrupt the buffers ("Low number of
+  // points"). Pinning the lidar callback to its own 1-thread spinner serializes
+  // it while the deep queue buffers the backlog -> DLIO flushes every scan at its
+  // own pace, deterministically, regardless of playback speed. IMU and the rest
+  // stay on the global queue/spinner, so IMU is never starved by lidar work.
+  ros::CallbackQueue lidar_cb_queue;
+  std::shared_ptr<ros::AsyncSpinner> lidar_spinner;
 
   // Publishers
   ros::Publisher odom_pub;
@@ -291,6 +307,32 @@ private:
 
   bool adaptive_params_;
 
+  // Opt-in (~dlio/deterministic): force single-threaded GICP so its OpenMP
+  // reduction order is fixed. Cuts run-to-run pose noise ~7x (median ~11mm ->
+  // ~1.5mm) but is NOT bit-identical: nano_gicp covariance computation and the
+  // async submap-build timing still vary. Off by default (multi-threaded,
+  // faster). NOTE: playback-rate independence does NOT need this -- the cross-
+  // rate diff already equals the same-rate diff. Use only if you want maximum
+  // run-to-run reproducibility and can accept the slowdown (the deep queue
+  // absorbs the extra lag for offline recording).
+  bool deterministic_;
+
+  // High-rate odom (~dlio/highrate_odom). Replaces the removed 100Hz wall-clock
+  // timer with a DATA-DRIVEN emitter: at the end of each processed scan we IMU-
+  // integrate the just-finished scan interval (prev corrected pose -> this scan)
+  // and publish dense (~highrate_odom_hz) poses on the odom topic, stamped at the
+  // IMU times. It runs in the scan callback so it flushes at DLIO's processing
+  // rate (no wall-clock => no lag-warp), is bounded per-interval (no runaway
+  // dead-reckoning under backlog), and is read-only (never feeds the SLAM state,
+  // so no divergence). Off by default; the recorder launch sets it on.
+  bool publish_highrate_odom_;
+  double highrate_odom_dt_;            // decimation period (s); 0.01 = 100Hz
+  bool highrate_anchor_valid_;
+  double highrate_prev_stamp_;
+  Eigen::Vector3f highrate_prev_p_;
+  Eigen::Quaternionf highrate_prev_q_;
+  Eigen::Vector3f highrate_prev_v_;
+
   double obs_submap_thresh_;
   double obs_keyframe_thresh_;
   double obs_keyframe_lag_;
@@ -304,6 +346,11 @@ private:
   double submap_concave_alpha_;
 
   bool densemap_filtered_;
+  // When true (default), the PUBLISHED/saved deskewed cloud is the full-density
+  // (non-voxelized) deskewed_scan instead of the voxelized current_scan. GICP,
+  // keyframes and the map keep using the voxelized current_scan — this only
+  // affects the published `deskewed` topic (and thus the exporter's saved PCDs).
+  bool dense_output_;
   bool wait_until_move_;
 
   double crop_size_;
@@ -317,6 +364,13 @@ private:
   bool gravity_align_;
   double imu_calib_time_;
   int imu_buffer_size_;
+  // ROS subscriber queue depths. Default 1/1000 = live (drop stale scans to stay
+  // real-time). For deterministic bag recording set large so no scan/IMU is ever
+  // dropped under processing lag -- the output then depends only on the bag, not
+  // on playback speed. Paired with a large imu_buffer_size_ so late scans still
+  // find their IMU window.
+  int sub_pointcloud_queue_;
+  int sub_imu_queue_;
   Eigen::Matrix3f imu_accel_sm_;
 
   int gicp_min_num_points_;

@@ -48,19 +48,41 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
   this->deskew_status = false;
   this->deskew_size = 0;
 
-  this->lidar_sub = this->nh.subscribe("pointcloud", 1,
-      &dlio::OdomNode::callbackPointCloud, this, ros::TransportHints().tcpNoDelay());
-  this->imu_sub = this->nh.subscribe("imu", 1000,
+  // Lidar subscriber on a DEDICATED single-threaded callback queue (see odom.h):
+  // a deep queue buffers the scan backlog while its lone spinner thread runs
+  // callbackPointCloud strictly serially -> DLIO flushes every scan at its own
+  // pace with no drops and no concurrent-callback corruption, regardless of how
+  // fast the bag is played.
+  ros::SubscribeOptions lidar_opts = ros::SubscribeOptions::create<sensor_msgs::PointCloud2>(
+      "pointcloud", this->sub_pointcloud_queue_,
+      [this](const sensor_msgs::PointCloud2ConstPtr& m) { this->callbackPointCloud(m); },
+      ros::VoidPtr(), &this->lidar_cb_queue);
+  lidar_opts.transport_hints = ros::TransportHints().tcpNoDelay();
+  this->lidar_sub = this->nh.subscribe(lidar_opts);
+  this->lidar_spinner = std::make_shared<ros::AsyncSpinner>(1, &this->lidar_cb_queue);
+  this->lidar_spinner->start();
+
+  // IMU stays on the node's global callback queue (multi-threaded spinner), so it
+  // keeps draining while the lidar thread is busy on a scan.
+  this->imu_sub = this->nh.subscribe("imu", this->sub_imu_queue_,
       &dlio::OdomNode::callbackImu, this, ros::TransportHints().tcpNoDelay());
 
-  this->odom_pub     = this->nh.advertise<nav_msgs::Odometry>("odom", 1, true);
+  // Deep publisher queue: highrate_odom emits a ~10-sample burst per scan (not 1
+  // msg/scan), so a queue of 1 silently drops most of a burst before the
+  // subscriber's TCP can drain it. Size it to buffer a full bag's worth of 100Hz
+  // odom even if the recorder stalls during heavy PCD/image writes (msgs are tiny).
+  this->odom_pub     = this->nh.advertise<nav_msgs::Odometry>("odom", 200000, true);
   this->pose_pub     = this->nh.advertise<geometry_msgs::PoseStamped>("pose", 1, true);
   this->path_pub     = this->nh.advertise<nav_msgs::Path>("path", 1, true);
   this->kf_pose_pub  = this->nh.advertise<geometry_msgs::PoseArray>("kf_pose", 1, true);
   this->kf_cloud_pub = this->nh.advertise<sensor_msgs::PointCloud2>("kf_cloud", 1, true);
   this->deskewed_pub = this->nh.advertise<sensor_msgs::PointCloud2>("deskewed", 1, true);
 
-  this->publish_timer = this->nh.createTimer(ros::Duration(0.01), &dlio::OdomNode::publishPose, this);
+  // Odom/pose are published PER-SCAN from callbackPointCloud (stamped with the
+  // scan time), not on a 100Hz wall-clock timer stamped imu_stamp. The timer
+  // decoupled the odom stamp from the scan it reflects, so under processing
+  // backlog the recorded trajectory got mis-stamped by up to tens of seconds.
+  // this->publish_timer = this->nh.createTimer(ros::Duration(0.01), &dlio::OdomNode::publishPose, this);
 
   this->T = Eigen::Matrix4f::Identity();
   this->T_prior = Eigen::Matrix4f::Identity();
@@ -127,6 +149,13 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
   this->gicp.setSearchMethodTarget(temp, true);
   this->gicp_temp.setSearchMethodSource(temp, true);
   this->gicp_temp.setSearchMethodTarget(temp, true);
+
+  // Determinism: single-threaded GICP fixes its OpenMP reduction order, cutting
+  // run-to-run FP pose noise ~7x (~11mm -> ~1.5mm; not bit-exact). Opt-in (off =
+  // multi-threaded, faster).
+  const int gicp_threads = this->deterministic_ ? 1 : this->num_threads_;
+  this->gicp.setNumThreads(gicp_threads);
+  this->gicp_temp.setNumThreads(gicp_threads);
 
   this->geo.first_opt_done = false;
   this->geo.prev_vel = Eigen::Vector3f(0., 0., 0.);
@@ -226,6 +255,11 @@ void dlio::OdomNode::getParams() {
   // Dense map resolution
   ros::param::param<bool>("~dlio/map/dense/filtered", this->densemap_filtered_, true);
 
+  // Full-density output: publish/save the NON-voxelized deskewed scan (default on).
+  // Overrides densemap_filtered_ for the published `deskewed` topic only; GICP,
+  // keyframes and the map are unaffected (they use the voxelized current_scan).
+  ros::param::param<bool>("~dlio/pointcloud/dense_output", this->dense_output_, true);
+
   // Wait until movement to publish map
   ros::param::param<bool>("~dlio/map/waitUntilMove", this->wait_until_move_, false);
 
@@ -238,6 +272,20 @@ void dlio::OdomNode::getParams() {
 
   // Adaptive Parameters
   ros::param::param<bool>("~dlio/adaptive", this->adaptive_params_, true);
+
+  // Force single-threaded GICP for bit-identical, reproducible poses (slower).
+  ros::param::param<bool>("~dlio/deterministic", this->deterministic_, false);
+
+  // High-rate (data-driven) odom: dense IMU-rate poses on the odom topic.
+  ros::param::param<bool>("~dlio/highrate_odom", this->publish_highrate_odom_, false);
+  double highrate_hz;
+  ros::param::param<double>("~dlio/highrate_odom_hz", highrate_hz, 100.0);
+  this->highrate_odom_dt_ = (highrate_hz > 0.0) ? (1.0 / highrate_hz) : 0.01;
+  this->highrate_anchor_valid_ = false;
+  this->highrate_prev_stamp_ = 0.0;
+  this->highrate_prev_p_ = Eigen::Vector3f(0., 0., 0.);
+  this->highrate_prev_q_ = Eigen::Quaternionf(1., 0., 0., 0.);
+  this->highrate_prev_v_ = Eigen::Vector3f(0., 0., 0.);
 
   // Extrinsics
   std::vector<float> t_default{0., 0., 0.};
@@ -275,6 +323,11 @@ void dlio::OdomNode::getParams() {
   ros::param::param<bool>("~dlio/odom/imu/calibration/gyro", this->calibrate_gyro_, true);
   ros::param::param<double>("~dlio/odom/imu/calibration/time", this->imu_calib_time_, 3.0);
   ros::param::param<int>("~dlio/odom/imu/bufferSize", this->imu_buffer_size_, 2000);
+
+  // Subscriber queue depths (see odom.h). Defaults preserve live behavior; the
+  // recorder launch sets these large for drop-free deterministic bag processing.
+  ros::param::param<int>("~dlio/sub_pointcloud_queue", this->sub_pointcloud_queue_, 1);
+  ros::param::param<int>("~dlio/sub_imu_queue", this->sub_imu_queue_, 1000);
 
   std::vector<float> accel_default{0., 0., 0.}; std::vector<float> prior_accel_bias;
   std::vector<float> gyro_default{0., 0., 0.}; std::vector<float> prior_gyro_bias;
@@ -340,10 +393,79 @@ void dlio::OdomNode::start() {
 
 }
 
-void dlio::OdomNode::publishPose(const ros::TimerEvent& e) {
+// High-rate (~100Hz) odom for the JUST-FINISHED scan interval. This replaces the
+// removed wall-clock 100Hz publish_timer: it is DATA-DRIVEN (called once per
+// processed scan from callbackPointCloud, so it flushes at the processing rate
+// and never lag-warps), BOUNDED (only the one scan interval's worth of samples,
+// so a backlog can't make it run away), and READ-ONLY (it integrates a private
+// copy of the IMU prior off the previous corrected anchor and never touches
+// this->state / the geo-observer, so it can't cause the divergence the old
+// real-time propagate did). It emits dense poses on the SAME odom topic, stamped
+// at uniform-decimated times strictly INSIDE (prev_corrected_stamp, scan_stamp);
+// the corrected per-scan pose at exactly scan_stamp is published by publishPose()
+// right after, so the exporter's nearest-stamp pairing still snaps clouds to the
+// corrected pose (dt=0 wins) while odom.json gets the full ~100Hz stream for
+// B-spline interpolation. The anchor is re-set to the corrected this->state at
+// the end of publishPose(), so each interval is integrated fresh off a corrected
+// pose (no unbounded drift; a tiny discontinuity at each scan boundary is fine
+// for interpolation).
+void dlio::OdomNode::publishHighRateInterval() {
+  if (!this->publish_highrate_odom_ || !this->highrate_anchor_valid_) return;
+  if (this->scan_stamp <= this->highrate_prev_stamp_) return;
 
-  // nav_msgs::Odometry
-  this->odom_ros.header.stamp = this->imu_stamp;
+  // Uniform decimated sample times strictly inside the interval. Stop HALF a dt
+  // before scan_stamp so the final high-rate sample can't land within a few us of
+  // it (which would make a near-zero-dt pair in odom.json that differs by the
+  // geo-observer correction jump -- a spurious spike for B-spline fitting). The
+  // corrected pose at exactly scan_stamp, emitted by publishPose() right after,
+  // owns that final point of the interval.
+  const double t_end = this->scan_stamp - 0.5 * this->highrate_odom_dt_;
+  std::vector<double> ts;
+  for (double t = this->highrate_prev_stamp_ + this->highrate_odom_dt_;
+       t < t_end; t += this->highrate_odom_dt_) {
+    ts.push_back(t);
+  }
+  if (ts.empty()) return;
+
+  // Forward-integrate the IMU prior from the previous corrected anchor. Returns
+  // world poses at each ts; empty if the IMU window isn't available (lag/gap) ->
+  // we simply skip this interval rather than emit anything wrong.
+  auto frames = this->integrateImu(this->highrate_prev_stamp_, this->highrate_prev_q_,
+                                   this->highrate_prev_p_, this->highrate_prev_v_, ts);
+  if (frames.size() != ts.size()) return;
+
+  nav_msgs::Odometry o;
+  o.header.frame_id = this->odom_frame;
+  o.child_frame_id = this->baselink_frame;
+  for (size_t i = 0; i < ts.size(); ++i) {
+    const Eigen::Matrix4f& T = frames[i];
+    o.header.stamp = ros::Time(ts[i]);
+    o.pose.pose.position.x = T(0,3);
+    o.pose.pose.position.y = T(1,3);
+    o.pose.pose.position.z = T(2,3);
+    Eigen::Quaternionf q(T.block<3,3>(0,0));
+    q.normalize();
+    o.pose.pose.orientation.w = q.w();
+    o.pose.pose.orientation.x = q.x();
+    o.pose.pose.orientation.y = q.y();
+    o.pose.pose.orientation.z = q.z();
+    this->odom_pub.publish(o);
+  }
+}
+
+void dlio::OdomNode::publishPose() {
+
+  // Emit the dense ~100Hz poses for the interval that just closed (samples are
+  // strictly before scan_stamp), THEN the corrected per-scan pose below.
+  this->publishHighRateInterval();
+
+  // nav_msgs::Odometry. Stamped with scan_stamp = the MEDIAN point time, which is
+  // the time this->state actually represents (the geo-observer is propagated to
+  // scan_stamp and corrected toward lidarPose = T_corr*frames[median]). NOT
+  // scan_header_stamp (the scan FRONT) -- that header is ~50ms earlier than the
+  // pose value and would mislabel it. NOT imu_stamp -- this is called once per
+  // processed scan from callbackPointCloud, matching the deskewed cloud's stamp.
+  this->odom_ros.header.stamp = ros::Time(this->scan_stamp);
   this->odom_ros.header.frame_id = this->odom_frame;
   this->odom_ros.child_frame_id = this->baselink_frame;
 
@@ -366,8 +488,9 @@ void dlio::OdomNode::publishPose(const ros::TimerEvent& e) {
 
   this->odom_pub.publish(this->odom_ros);
 
-  // geometry_msgs::PoseStamped
-  this->pose_ros.header.stamp = this->imu_stamp;
+  // geometry_msgs::PoseStamped (stamped at scan_stamp = MEDIAN = the time the pose
+  // value represents; see the odom stamp above).
+  this->pose_ros.header.stamp = ros::Time(this->scan_stamp);
   this->pose_ros.header.frame_id = this->odom_frame;
 
   this->pose_ros.pose.position.x = this->state.p[0];
@@ -381,17 +504,26 @@ void dlio::OdomNode::publishPose(const ros::TimerEvent& e) {
 
   this->pose_pub.publish(this->pose_ros);
 
+  // Re-anchor the high-rate stream to THIS scan's corrected state at scan_stamp,
+  // so the next interval integrates fresh off a corrected pose (read-only copy;
+  // does not feed back into the SLAM state). v.lin.w is the world-frame velocity.
+  this->highrate_prev_stamp_ = this->scan_stamp;
+  this->highrate_prev_p_ = this->state.p;
+  this->highrate_prev_q_ = this->state.q;
+  this->highrate_prev_v_ = this->state.v.lin.w;
+  this->highrate_anchor_valid_ = true;
+
 }
 
 void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud) {
   this->publishCloud(published_cloud, T_cloud);
 
   // nav_msgs::Path
-  this->path_ros.header.stamp = this->imu_stamp;
+  this->path_ros.header.stamp = ros::Time(this->scan_stamp);  // scan time (the pose's time), not imu_stamp -- so TF/path keep advancing with the scans being drained, even after the bag (IMU) stops
   this->path_ros.header.frame_id = this->odom_frame;
 
   geometry_msgs::PoseStamped p;
-  p.header.stamp = this->imu_stamp;
+  p.header.stamp = ros::Time(this->scan_stamp);  // scan time (the pose's time), not imu_stamp -- so TF/path keep advancing with the scans being drained, even after the bag (IMU) stops
   p.header.frame_id = this->odom_frame;
   p.pose.position.x = this->state.p[0];
   p.pose.position.y = this->state.p[1];
@@ -408,7 +540,7 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   static tf2_ros::TransformBroadcaster br;
   geometry_msgs::TransformStamped transformStamped;
 
-  transformStamped.header.stamp = this->imu_stamp;
+  transformStamped.header.stamp = ros::Time(this->scan_stamp);  // scan time (the pose's time), not imu_stamp -- so TF/path keep advancing with the scans being drained, even after the bag (IMU) stops
   transformStamped.header.frame_id = this->odom_frame;
   transformStamped.child_frame_id = this->baselink_frame;
 
@@ -424,7 +556,7 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   br.sendTransform(transformStamped);
 
   // transform: baselink to imu
-  transformStamped.header.stamp = this->imu_stamp;
+  transformStamped.header.stamp = ros::Time(this->scan_stamp);  // scan time (the pose's time), not imu_stamp -- so TF/path keep advancing with the scans being drained, even after the bag (IMU) stops
   transformStamped.header.frame_id = this->baselink_frame;
   transformStamped.child_frame_id = this->imu_frame;
 
@@ -441,7 +573,7 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   br.sendTransform(transformStamped);
 
   // transform: baselink to lidar
-  transformStamped.header.stamp = this->imu_stamp;
+  transformStamped.header.stamp = ros::Time(this->scan_stamp);  // scan time (the pose's time), not imu_stamp -- so TF/path keep advancing with the scans being drained, even after the bag (IMU) stops
   transformStamped.header.frame_id = this->baselink_frame;
   transformStamped.child_frame_id = this->lidar_frame;
 
@@ -472,7 +604,10 @@ void dlio::OdomNode::publishCloud(pcl::PointCloud<PointType>::ConstPtr published
   // published deskewed cloud
   sensor_msgs::PointCloud2 deskewed_ros;
   pcl::toROSMsg(*deskewed_scan_t_, deskewed_ros);
-  deskewed_ros.header.stamp = this->scan_header_stamp;
+  // Stamp at scan_stamp = MEDIAN point time (the cloud's rigid world anchor is
+  // T_corr*frames[median], and it must match the odom/pose stamp that labels the
+  // same-time pose value). NOT scan_header_stamp (the scan FRONT, ~50ms earlier).
+  deskewed_ros.header.stamp = ros::Time(this->scan_stamp);
   deskewed_ros.header.frame_id = this->odom_frame;
   this->deskewed_pub.publish(deskewed_ros);
 
@@ -892,15 +1027,33 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::PointCloud2ConstPtr& 
   this->prev_scan_stamp = this->scan_stamp;
   this->elapsed_time = this->scan_stamp - this->first_scan_stamp;
 
-  // Publish stuff to ROS
+  // Publish odom for THIS scan's corrected state, stamped with the scan time,
+  // synchronously and BEFORE the detached cloud-publish thread — so a downstream
+  // recorder sees "odom then cloud" lockstep per scan regardless of processing lag.
+  this->publishPose();
+
+  // Publish stuff to ROS — SYNCHRONOUSLY, in-order, within the callback. The old
+  // version spawned a DETACHED thread that read this->scan_header_stamp / state /
+  // T_corr as MEMBERS; the next callback would overwrite scan_header_stamp before
+  // the detached thread read it, so two distinct deskewed clouds could be
+  // published with the SAME stamp (a duplicate scan, playback-speed-dependent;
+  // it also raced path_ros). Publishing inline binds the cloud to THIS scan's
+  // stamp deterministically. Cost: ~a few ms of toROSMsg/publish added to the
+  // ~100 ms scan — negligible, and the recorder is lag-tolerant.
+  // Select the cloud to publish/save. dense_output_ (default true) wins: emit the
+  // FULL-DENSITY deskewed_scan (motion-compensated, crop+NaN only, no voxel) so the
+  // saved PCDs / deskewed topic are the finished dense product. GICP/keyframes/map
+  // are NOT affected (they consume the voxelized current_scan). With dense_output_
+  // off, fall back to the legacy densemap_filtered_ behavior.
   pcl::PointCloud<PointType>::ConstPtr published_cloud;
-  if (this->densemap_filtered_) {
+  if (this->dense_output_) {
+    published_cloud = this->deskewed_scan;
+  } else if (this->densemap_filtered_) {
     published_cloud = this->current_scan;
   } else {
     published_cloud = this->deskewed_scan;
   }
-  this->publish_thread = std::thread( &dlio::OdomNode::publishToROS, this, published_cloud, this->T_corr );
-  this->publish_thread.detach();
+  this->publishToROS(published_cloud, this->T_corr);
 
   // Update some statistics
   this->comp_times.push_back(ros::Time::now().toSec() - then);
@@ -1051,16 +1204,24 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::Imu::ConstPtr& imu_raw) {
     // Notify the callbackPointCloud thread that IMU data exists for this time
     this->cv_imu_stamp.notify_one();
 
-    if (this->geo.first_opt_done) {
-      // Geometric Observer: Propagate State
-      this->propagateState();
-    }
+    // NOTE: the geometric-observer PREDICT is NOT done here (real time) anymore.
+    // It is done scan-windowed in getNextPose() via propagateStateScanWindow(),
+    // so the state never runs ahead of the scan being processed under lag. This
+    // callback now only buffers IMU.
 
   }
 
 }
 
 void dlio::OdomNode::getNextPose() {
+
+  // Geometric-observer PREDICT, scan-windowed: advance the state to THIS scan's
+  // time using only the IMU within (prev_scan_stamp, scan_stamp], so it is never
+  // ahead of the scan (see propagateStateScanWindow). Gated on first_opt_done to
+  // match the upstream behavior (no propagation before the first optimization).
+  if (this->geo.first_opt_done) {
+    this->propagateStateScanWindow();
+  }
 
   // Check if the new submap is ready to be used
   this->new_submap_is_ready = (this->submap_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
@@ -1324,18 +1485,18 @@ void dlio::OdomNode::propagateGICP() {
 
 }
 
-void dlio::OdomNode::propagateState() {
+void dlio::OdomNode::propagateState(const ImuMeas& m) {
 
   // Lock thread to prevent state from being accessed by UpdateState
   std::lock_guard<std::mutex> lock( this->geo.mtx );
 
-  double dt = this->imu_meas.dt;
+  double dt = m.dt;
 
   Eigen::Quaternionf qhat = this->state.q, omega;
   Eigen::Vector3f world_accel;
 
   // Transform accel from body to world frame
-  world_accel = qhat._transformVector(this->imu_meas.lin_accel);
+  world_accel = qhat._transformVector(m.lin_accel);
 
   // Accel propogation
   this->state.p[0] += this->state.v.lin.w[0]*dt + 0.5*dt*dt*world_accel[0];
@@ -1349,7 +1510,7 @@ void dlio::OdomNode::propagateState() {
 
   // Gyro propogation
   omega.w() = 0;
-  omega.vec() = this->imu_meas.ang_vel;
+  omega.vec() = m.ang_vel;
   Eigen::Quaternionf tmp = qhat * omega;
   this->state.q.w() += 0.5 * dt * tmp.w();
   this->state.q.vec() += 0.5 * dt * tmp.vec();
@@ -1357,9 +1518,38 @@ void dlio::OdomNode::propagateState() {
   // Ensure quaternion is properly normalized
   this->state.q.normalize();
 
-  this->state.v.ang.b = this->imu_meas.ang_vel;
+  this->state.v.ang.b = m.ang_vel;
   this->state.v.ang.w = this->state.q.toRotationMatrix() * this->state.v.ang.b;
 
+}
+
+// Geometric-observer PREDICT, scan-windowed. The upstream design propagated the
+// state on EVERY IMU as it arrived (real time). Under any processing lag (e.g.
+// flushing a buffered backlog when a bag is played faster than DLIO can run),
+// the IMU floods ahead while the lidar callback is still on an OLD scan, so the
+// state runs far past it -> updateState() sees a huge error vs the (correct) old
+// scan pose -> the geometric observer diverges -> degenerate clouds ("Low number
+// of points"). Here we instead advance the state using ONLY the buffered IMU
+// inside (prev_scan_stamp, scan_stamp] -- the window of the scan we're about to
+// fuse -- so the state is always exactly at the scan being processed, never
+// ahead. At real time (no lag) this consumes the same samples as before, so the
+// result is identical; under lag it stays consistent. This makes the output a
+// function of the bag, independent of playback speed.
+void dlio::OdomNode::propagateStateScanWindow() {
+
+  std::vector<ImuMeas> window;
+  {
+    std::lock_guard<std::mutex> imu_lock( this->mtx_imu );
+    // imu_buffer is push_front (front = newest); rbegin..rend is oldest..newest.
+    for (auto it = this->imu_buffer.rbegin(); it != this->imu_buffer.rend(); ++it) {
+      if (it->stamp > this->prev_scan_stamp && it->stamp <= this->scan_stamp) {
+        window.push_back(*it);
+      }
+    }
+  }
+  for (const auto& m : window) {
+    this->propagateState(m);
+  }
 }
 
 void dlio::OdomNode::updateState() {
