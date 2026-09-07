@@ -131,6 +131,8 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
   this->degen_w_min_ = 1.;
   this->degen_removed_ = 0.;
   this->degen_removed_total_ = 0.;
+  this->degen_innov_ = 0.;
+  this->degen_dp_ = 0.;
   this->degen_scans_ = 0;
   this->degen_degenerate_ = 0;
   this->degen_applied_ = 0;
@@ -396,6 +398,11 @@ void dlio::OdomNode::getParams() {
   ros::param::param<bool>  ("~dlio/odom/gicp/degeneracy/observe",       this->degen_params_.observe,       false);
   ros::param::param<double>("~dlio/odom/gicp/degeneracy/min_ratio",     this->degen_params_.min_ratio,     0.02);
   ros::param::param<double>("~dlio/odom/gicp/degeneracy/full_ratio",    this->degen_params_.full_ratio,    0.10);
+  // ABSOLUTE per-point information band, q = lambda_k/ncorr. 0/0 = OFF, which is
+  // what every row that predates this key gets: the ratio test alone, unchanged.
+  // See dlio/degeneracy.h for why the ratio needs a companion at all.
+  ros::param::param<double>("~dlio/odom/gicp/degeneracy/min_info",      this->degen_params_.min_info,      0.0);
+  ros::param::param<double>("~dlio/odom/gicp/degeneracy/full_info",     this->degen_params_.full_info,     0.0);
   ros::param::param<int>   ("~dlio/odom/gicp/degeneracy/max_weak_dirs", this->degen_params_.max_weak_dirs, 1);
   // The weight FLOOR. Defaults to 0.25, not 0: w = 0 hands the weak axis to a
   // free double integrator for the whole degenerate stretch (780 s on the
@@ -1294,6 +1301,12 @@ void dlio::OdomNode::getNextPose() {
   this->T_corr = this->gicp.getFinalTransformation(); // "correction" transformation
   this->T = this->T_corr * this->T_prior;
 
+  // INSTRUMENT ONLY: how far the registration moved this scan, BEFORE any
+  // guard_pose correction. Nothing reads it but the [DEGEN] line; it is the
+  // registration's own movement, which the exported pose step only approximates
+  // (the observer sits between them).
+  this->degen_dp_ = (double)(this->T.block<3,1>(0,3) - this->T_prior.block<3,1>(0,3)).norm();
+
   // Score THIS scan's registration geometry (no-op unless the guard is armed
   // or observing). Must run here: the Hessian belongs to the align() above.
   this->scoreDegeneracy();
@@ -1379,10 +1392,14 @@ void dlio::OdomNode::logDegeneracy() {
     // defaults do. `rm` is this scan's metres, `RM` the run's cumulative total.
     // Under print_mutex_ so a flush cannot land inside a status-banner line.
     std::lock_guard<std::mutex> print_lock(this->print_mutex_);
+    // The new fields are APPENDED, never inserted: every parser written against
+    // the first three runs' logs (proof_data/analyse_run.py, aa/fine.py) matches
+    // this line with a regex that ends at inv=, and must keep matching.
     printf("[DEGEN] t=%.4f valid=%d ncorr=%d lam=%.6g %.6g %.6g r=%.6f %.6f %.6f "
            "w=%.4f %.4f %.4f u_min=(%.4f,%.4f,%.4f) weak=%d rm=%.6f RM=%.4f "
            "tau=%.4f/%.4f wfloor=%.3f mode=%s "
-           "n=%ld deg=%ld app=%ld inv=%ld\n",
+           "n=%ld deg=%ld app=%ld inv=%ld "
+           "q_min=%.6g info=%.4f/%.4f innov=%.4f dp=%.4f\n",
            this->scan_stamp, (int)W.valid, W.ncorr,
            W.lambda(0), W.lambda(1), W.lambda(2),
            W.ratio(0), W.ratio(1), W.ratio(2),
@@ -1393,7 +1410,10 @@ void dlio::OdomNode::logDegeneracy() {
            this->degen_params_.min_weight,
            this->degen_params_.enabled ? "guard" : "observe",
            (long)this->degen_scans_, (long)this->degen_degenerate_,
-           (long)this->degen_applied_, (long)this->degen_invalid_);
+           (long)this->degen_applied_, (long)this->degen_invalid_,
+           W.info(0),
+           this->degen_params_.min_info, this->degen_params_.full_info,
+           (double)this->degen_innov_, (double)this->degen_dp_);
     fflush(stdout);
   }
 
@@ -1427,10 +1447,12 @@ void dlio::OdomNode::logDegeneracy() {
             "[DEGEN][WARN] guard enabled for %ld scans (%ld refused) and NOT ONE was "
             "scored degenerate. Either the geometry never degenerated, or the guard "
             "cannot see it: check the r column against min_ratio=%.4f/full_ratio=%.4f, "
-            "max_weak_dirs=%d, min_corr=%d, and that these values reached the node "
-            "(rosparam dump /robot/dlio_odom), not just the recipe row.\n",
+            "the q_min column against min_info=%.4f/full_info=%.4f (0/0 = the absolute "
+            "test is off), max_weak_dirs=%d, min_corr=%d, and that these values reached "
+            "the node (rosparam dump /robot/dlio_odom), not just the recipe row.\n",
             (long)this->degen_scans_, (long)this->degen_invalid_,
             this->degen_params_.min_ratio, this->degen_params_.full_ratio,
+            this->degen_params_.min_info, this->degen_params_.full_info,
             this->degen_params_.max_weak_dirs, this->degen_params_.min_corr);
     fflush(stderr);
   }
@@ -1757,6 +1779,13 @@ void dlio::OdomNode::updateState() {
   qcorr = qhat * qcorr;
 
   Eigen::Vector3f err = pin - this->state.p;
+
+  // INSTRUMENT ONLY: the RAW observer innovation, recorded before the guard can
+  // touch it and whether or not the guard is armed. This is the quantity
+  // innov_max_m gates, and no run before this one logged it - the A/A analysis
+  // had to infer it from exported pose steps because the banner's Position {W}
+  // is the same series as the exported pose, not the disagreement.
+  this->degen_innov_ = (double)err.norm();
 
   // --- GICP degeneracy guard ------------------------------------------------
   // Along a direction the scan cannot measure, `err` is not evidence: it is the

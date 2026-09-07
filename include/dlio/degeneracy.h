@@ -27,6 +27,27 @@ struct Params {
   bool   observe       = false;  // score + log only, zero arithmetic change (implied by enabled)
   double min_ratio     = 0.02;   // tau_lo: lambda_k/lambda_max below this => w=0 (unobservable)
   double full_ratio    = 0.10;   // tau_hi: above this => w=1; smoothstep in between
+  // ABSOLUTE per-point information, q_k = lambda_k / ncorr, tested BESIDE the
+  // ratio and combined by taking the TIGHTER of the two weights.
+  //
+  // Why a second measure at all. Htt = 0.5*N*I + 499.5*sum n_i n_i^T under PLANE
+  // regularisation, so q_k = lambda_k/N is - up to those two constants - the MEAN
+  // SQUARED COMPONENT of the correspondence normals along direction k: count-free
+  // and scene-intrinsic, in a fixed range, where the raw eigenvalue is not. The
+  // RATIO lambda_k/lambda_max is count-free too, but it is blind to the failure
+  // that actually happened on the big Sandland bag (ad3517ba, aa/AA_ANALYSIS.md
+  // section 4): when the submap goes STALE the whole Hessian collapses, lambda_max
+  // falls WITH lambda_min, and the ratio stays at the bag median while the scan
+  // carries an order of magnitude less information than a healthy draw of the same
+  // seconds. Over bag t 355-367 the diverging draw's q_min was 1.3-2.4 against
+  // 5.2-31 in each of the two surviving draws AT THE SAME correspondence count;
+  // its r_min, 0.08-0.21, was unremarkable. One measure sees a THIN scene, the
+  // other sees a scene that has stopped being measured; a corridor can do both.
+  //
+  // full_info = 0 disables the test entirely (the shipped default), so an existing
+  // row that sets neither key keeps exactly the arithmetic it had.
+  double min_info      = 0.0;    // q_lo: lambda_k/ncorr below this => w=0 before the floor
+  double full_info     = 0.0;    // q_hi: above this => w=1. 0 => the info test is OFF
   int    max_weak_dirs = 1;      // never down-weight more than this many of the 3 directions
   // FLOOR on the observability weight. w = 0 does not merely ignore a bad
   // measurement: it disconnects the axis from every correction updateState()
@@ -47,6 +68,8 @@ struct Params {
   int    log_every     = 1;      // scans between [DEGEN] lines
 
   bool scoring() const { return enabled || observe; }
+  // The absolute test is opt-in: a band of 0/0 leaves the ratio test alone.
+  bool info_test() const { return full_info > 0.0; }
 };
 
 // One scan's verdict.
@@ -55,6 +78,7 @@ struct Weights {
   Eigen::Matrix3d U      = Eigen::Matrix3d::Identity();    // columns = eigenvectors, ASCENDING eigenvalue
   Eigen::Vector3d lambda = Eigen::Vector3d::Ones();        // eigenvalues, ascending
   Eigen::Vector3d ratio  = Eigen::Vector3d::Ones();        // lambda_k / lambda_max, in (0,1]
+  Eigen::Vector3d info   = Eigen::Vector3d::Ones();        // lambda_k / ncorr (absolute, count-free)
   Eigen::Vector3d w      = Eigen::Vector3d::Ones();        // per-direction observability weight
   int             ncorr  = 0;
   int             weak   = 0;                              // how many directions have w < 1
@@ -62,6 +86,7 @@ struct Weights {
   double lambda_min() const { return lambda(0); }
   double lambda_max() const { return lambda(2); }
   double ratio_min()  const { return ratio(0);  }
+  double info_min()   const { return info(0);   }
   double w_min()      const { return w.minCoeff(); }
   bool   degenerate() const { return weak > 0; }
   // True when the guard would change nothing at all, whatever the error is.
@@ -137,6 +162,7 @@ inline Weights degeneracy_weights(const Eigen::Matrix3d& Htt,
   for (int k = 0; k < 3; ++k) {
     const double lk = std::max(0.0, W.lambda(k));
     W.ratio(k) = lk / lmax;
+    W.info(k)  = lk / static_cast<double>(std::max(1, ncorr));
     // Only the maxweak WEAKEST directions may be down-weighted; the eigenvalues
     // are ascending so those are exactly indices 0 .. maxweak-1. Zeroing all
     // three would hand the whole pose to dead reckoning.
@@ -146,9 +172,17 @@ inline Weights degeneracy_weights(const Eigen::Matrix3d& Htt,
     // min_weight = 1 therefore reproduces stock DLIO exactly and reports weak=0,
     // which keeps the silent-no-op pairing honest instead of raising a false
     // alarm about a guard the operator asked to do nothing.
-    W.w(k) = (k < maxweak)
-                 ? std::max(wfloor, smoothstep(W.ratio(k), p.min_ratio, p.full_ratio))
-                 : 1.0;
+    //
+    // Two criteria, the TIGHTER one wins, then the floor. Neither can rescue a
+    // direction the other condemns: a scan is trusted along k only if it is both
+    // well-CONDITIONED (ratio) and actually INFORMED (info). Taking the minimum
+    // rather than, say, a product keeps each band readable on its own scale -
+    // each one alone still produces exactly the weight it would have produced.
+    double wk = smoothstep(W.ratio(k), p.min_ratio, p.full_ratio);
+    if (p.info_test()) {
+      wk = std::min(wk, smoothstep(W.info(k), p.min_info, p.full_info));
+    }
+    W.w(k) = (k < maxweak) ? std::max(wfloor, wk) : 1.0;
     if (W.w(k) < 1.0) ++W.weak;
   }
   return W;

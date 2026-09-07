@@ -408,6 +408,15 @@ private:
   std::atomic<double> degen_ratio_min_;      // lambda_min / lambda_max this scan
   std::atomic<double> degen_w_min_;          // smallest observability weight this scan
   std::atomic<double> degen_removed_;        // |err| removed from the observer THIS scan (metres)
+  // INSTRUMENT ONLY, no arithmetic depends on either: the two numbers that did
+  // not exist in any artifact of the first three runs and had to be inferred
+  // from pose steps (aa/AA_ANALYSIS.md section 8). degen_innov_ is the RAW
+  // observer innovation |pin - state.p| BEFORE the guard touches it - the
+  // quantity innov_max_m would gate, so arm (c) cannot be calibrated without
+  // it. degen_dp_ is the GICP translation increment |T.p - T_prior.p| of the
+  // same scan: registration movement, as distinct from observer disagreement.
+  std::atomic<double> degen_innov_;          // |err_raw| this scan (metres)
+  std::atomic<double> degen_dp_;             // |T.p - T_prior.p| this scan (metres)
   // Cumulative |err_raw - err|, metres, over the whole run. degen_removed_ is
   // per-scan and degen_applied_ counts SCANS, so neither can answer the one
   // question a finished run has to answer: HOW MUCH correction authority did the
