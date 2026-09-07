@@ -146,6 +146,12 @@ private:
   std::vector<std::shared_ptr<const nano_gicp::CovarianceList>> keyframe_normals;
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> keyframe_transformations;
   std::mutex keyframes_mutex;
+  // publishKeyframe() runs on a DETACHED thread, one per unprocessed keyframe,
+  // and mutates kf_pose_ros before publishing it. roscpp serializes a message in
+  // two passes (measure, then write into an exactly-sized buffer); a concurrent
+  // push_back between the passes overruns the buffer and throws
+  // StreamOverrunException out of a thread with no handler => std::terminate.
+  std::mutex kf_pose_mutex;
 
   // Sensor Type
   dlio::SensorType sensor;

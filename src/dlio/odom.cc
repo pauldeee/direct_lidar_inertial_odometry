@@ -624,12 +624,26 @@ void dlio::OdomNode::publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen:
   p.orientation.x = kf.first.second.x();
   p.orientation.y = kf.first.second.y();
   p.orientation.z = kf.first.second.z();
-  this->kf_pose_ros.poses.push_back(p);
+  // publishKeyframe runs on a DETACHED thread, one per unprocessed keyframe, so
+  // several can be inside this function at once. roscpp serializes in two passes
+  // (measure the message, then write it into an exactly-sized buffer); a
+  // push_back landing between the passes overruns the buffer and throws
+  // StreamOverrunException out of a thread with no handler => std::terminate.
+  // That is the abort seen four times on the big Sandland bag, always inside a
+  // burst of one-keyframe-per-scan. Mutate under the lock, then serialize a
+  // PRIVATE COPY outside it: identical message content, no race, no knob —
+  // "please corrupt my message buffer" is not an option anyone should have.
+  geometry_msgs::PoseArray kf_msg;
+  {
+    std::lock_guard<std::mutex> lock(this->kf_pose_mutex);
+    this->kf_pose_ros.poses.push_back(p);
+    this->kf_pose_ros.header.stamp = timestamp;
+    this->kf_pose_ros.header.frame_id = this->odom_frame;
+    kf_msg = this->kf_pose_ros;
+  }
 
   // Publish
-  this->kf_pose_ros.header.stamp = timestamp;
-  this->kf_pose_ros.header.frame_id = this->odom_frame;
-  this->kf_pose_pub.publish(this->kf_pose_ros);
+  this->kf_pose_pub.publish(kf_msg);
 
   // publish keyframe scan for map
   if (this->vf_use_) {
