@@ -133,6 +133,13 @@ public:
   void setDebugPrint(bool lm_debug_print);
 
   const Eigen::Matrix<double, 6, 6>& getFinalHessian() const;
+  // True only when final_hessian_ was written by THIS call to
+  // computeTransformation(). step_lm() assigns it solely on an ACCEPTED step, so
+  // an unconverged scan (or one that converged on a rejected step) leaves the
+  // PREVIOUS scan's Hessian in the member. Anything that judges scan geometry
+  // from getFinalHessian() must gate on this or it silently scores the wrong
+  // scan. See dlio/degeneracy.h.
+  bool hasFinalHessian() const;
   double getFinalError() const;
 
   virtual void swapSourceAndTarget() {}
@@ -164,6 +171,7 @@ protected:
   bool lm_debug_print_;
 
   Eigen::Matrix<double, 6, 6> final_hessian_;
+  bool final_hessian_valid_;
   double final_error_;
 };
 }  // namespace nano_gicp

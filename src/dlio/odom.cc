@@ -125,6 +125,18 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
   this->elapsed_time = 0.;
   this->length_traversed;
 
+  // GICP degeneracy guard telemetry
+  this->degen_flag_ = false;
+  this->degen_lambda_min_ = 0.;
+  this->degen_ratio_min_ = 1.;
+  this->degen_w_min_ = 1.;
+  this->degen_removed_ = 0.;
+  this->degen_scans_ = 0;
+  this->degen_degenerate_ = 0;
+  this->degen_applied_ = 0;
+  this->degen_invalid_ = 0;
+  this->degen_noop_reported_ = false;
+
   this->convex_hull.setDimension(3);
   this->concave_hull.setDimension(3);
   this->concave_hull.setAlpha(this->keyframe_thresh_dist_);
@@ -375,6 +387,19 @@ void dlio::OdomNode::getParams() {
   ros::param::param<double>("~dlio/odom/geo/Kgb", this->geo_Kgb_, 1.0);
   ros::param::param<double>("~dlio/odom/geo/abias_max", this->geo_abias_max_, 1.0);
   ros::param::param<double>("~dlio/odom/geo/gbias_max", this->geo_gbias_max_, 1.0);
+
+  // GICP degeneracy guard. EVERY default here reproduces stock DLIO: with
+  // enabled=false and observe=false nothing is scored, nothing is logged, and
+  // updateState()/getNextPose() run exactly the arithmetic they always did.
+  ros::param::param<bool>  ("~dlio/odom/gicp/degeneracy/enabled",       this->degen_params_.enabled,       false);
+  ros::param::param<bool>  ("~dlio/odom/gicp/degeneracy/observe",       this->degen_params_.observe,       false);
+  ros::param::param<double>("~dlio/odom/gicp/degeneracy/min_ratio",     this->degen_params_.min_ratio,     0.02);
+  ros::param::param<double>("~dlio/odom/gicp/degeneracy/full_ratio",    this->degen_params_.full_ratio,    0.10);
+  ros::param::param<int>   ("~dlio/odom/gicp/degeneracy/max_weak_dirs", this->degen_params_.max_weak_dirs, 1);
+  ros::param::param<int>   ("~dlio/odom/gicp/degeneracy/min_corr",      this->degen_params_.min_corr,      200);
+  ros::param::param<bool>  ("~dlio/odom/gicp/degeneracy/guard_pose",    this->degen_params_.guard_pose,    false);
+  ros::param::param<double>("~dlio/odom/gicp/degeneracy/innov_max_m",   this->degen_params_.innov_max_m,   0.0);
+  ros::param::param<int>   ("~dlio/odom/gicp/degeneracy/log_every",     this->degen_params_.log_every,     1);
 
   ros::param::param<bool>("~dlio/verbose", this->verbose, true);
 }
@@ -1262,6 +1287,24 @@ void dlio::OdomNode::getNextPose() {
   this->T_corr = this->gicp.getFinalTransformation(); // "correction" transformation
   this->T = this->T_corr * this->T_prior;
 
+  // Score THIS scan's registration geometry (no-op unless the guard is armed
+  // or observing). Must run here: the Hessian belongs to the align() above.
+  this->scoreDegeneracy();
+
+  // Optional site 2 — guard the GICP translation increment itself, so the
+  // PUBLISHED pose does not take an unobservable jump either. T_corr must move
+  // by the same delta: it is what publishToROS transforms the recorded cloud by
+  // and what keyframe_transformations stores, so guarding T alone would put the
+  // clouds somewhere the poses do not agree with.
+  if (this->degen_params_.enabled && this->degen_params_.guard_pose &&
+      this->degen_w_.valid && !this->degen_w_.is_identity()) {
+    Eigen::Vector3f p_prior = this->T_prior.block<3,1>(0,3);
+    Eigen::Vector3f dp      = this->T.block<3,1>(0,3) - p_prior;
+    Eigen::Vector3f delta   = dlio::degeneracy::project_observable(dp, this->degen_w_) - dp;
+    this->T.block<3,1>(0,3)      += delta;
+    this->T_corr.block<3,1>(0,3) += delta;
+  }
+
   // Update next global pose
   // Both source and target clouds are in the global frame now, so tranformation is global
   this->propagateGICP();
@@ -1269,6 +1312,83 @@ void dlio::OdomNode::getNextPose() {
   // Geometric observer update
   this->updateState();
 
+  // Report AFTER the update, so the computed weights and the applied metres in
+  // the same [DEGEN] line belong to the same scan.
+  this->logDegeneracy();
+
+}
+
+// Score the current scan's GICP geometry and report it.
+//
+// The instrument, not the fix: with degeneracy/observe:=true this changes NO
+// arithmetic and only prints, which is how tau_lo/tau_hi get FITTED on a real
+// bag instead of guessed. With degeneracy/enabled:=true the weights computed
+// here are what updateState() projects its error onto.
+void dlio::OdomNode::scoreDegeneracy() {
+
+  if (!this->degen_params_.scoring()) {
+    this->degen_w_ = dlio::degeneracy::Weights();   // valid=false, w=(1,1,1)
+    return;
+  }
+
+  // H is [rot(0..2) | trans(3..5)] in the TARGET (global) frame — the same frame
+  // as the observer error, so nothing needs rotating. hasFinalHessian() refuses
+  // the scans whose LM never accepted a step, where final_hessian_ still holds
+  // the PREVIOUS scan's geometry.
+  const Eigen::Matrix<double,6,6>& H = this->gicp.getFinalHessian();
+  const Eigen::Matrix3d Htt = H.block<3,3>(3,3);
+
+  this->degen_w_ = dlio::degeneracy::degeneracy_weights(
+      Htt, this->gicp.hasFinalHessian(), this->gicp.num_correspondences, this->degen_params_);
+
+  const dlio::degeneracy::Weights& W = this->degen_w_;
+  ++this->degen_scans_;
+  if (!W.valid) ++this->degen_invalid_;
+  if (W.degenerate()) ++this->degen_degenerate_;
+
+  this->degen_flag_       = W.degenerate();
+  this->degen_lambda_min_ = W.valid ? W.lambda_min() : 0.;
+  this->degen_ratio_min_  = W.valid ? W.ratio_min()  : 1.;
+  this->degen_w_min_      = W.w_min();
+
+}
+
+// Report the scan just scored. Called AFTER updateState() so `removed` is THIS
+// scan's applied amount and not the previous one's — the whole point of the
+// pairing is that the two numbers describe the same scan.
+void dlio::OdomNode::logDegeneracy() {
+
+  if (!this->degen_params_.scoring()) return;
+
+  const dlio::degeneracy::Weights& W = this->degen_w_;
+  const int every = std::max(1, this->degen_params_.log_every);
+  if ((this->degen_scans_ % every) == 0) {
+    const Eigen::Vector3d u = W.U.col(0);
+    printf("[DEGEN] t=%.4f valid=%d ncorr=%d lam=%.6g %.6g %.6g r=%.6f %.6f %.6f "
+           "w=%.4f %.4f %.4f u_min=(%.4f,%.4f,%.4f) weak=%d removed=%.6f "
+           "n=%ld deg=%ld app=%ld inv=%ld\n",
+           this->scan_stamp, (int)W.valid, W.ncorr,
+           W.lambda(0), W.lambda(1), W.lambda(2),
+           W.ratio(0), W.ratio(1), W.ratio(2),
+           W.w(0), W.w(1), W.w(2),
+           u(0), u(1), u(2), W.weak, (double)this->degen_removed_,
+           (long)this->degen_scans_, (long)this->degen_degenerate_,
+           (long)this->degen_applied_, (long)this->degen_invalid_);
+    fflush(stdout);
+  }
+
+  // SILENT NO-OP LAW: computed > 0 while applied == 0 is a HARD ERROR, not a
+  // quiet success. Complain once, loudly, on stderr so it survives docker logs.
+  if (this->degen_params_.enabled && !this->degen_noop_reported_ &&
+      this->degen_degenerate_ > 100 && this->degen_applied_ == 0) {
+    this->degen_noop_reported_ = true;
+    fprintf(stderr,
+            "[DEGEN][ERROR] guard enabled and %ld scans scored DEGENERATE but the "
+            "observer error was never modified (applied=0). The guard is a no-op — "
+            "check that dlio/odom/gicp/degeneracy/enabled reached the node.\n",
+            (long)this->degen_degenerate_);
+    fflush(stderr);
+  }
 }
 
 bool dlio::OdomNode::imuMeasFromTimeRange(double start_time, double end_time,
@@ -1592,6 +1712,27 @@ void dlio::OdomNode::updateState() {
   qcorr = qhat * qcorr;
 
   Eigen::Vector3f err = pin - this->state.p;
+
+  // --- GICP degeneracy guard ------------------------------------------------
+  // Along a direction the scan cannot measure, `err` is not evidence: it is the
+  // un-correctable residual of an unobservable DOF. updateState drives THREE
+  // integrators off it (accel bias via Kab, position via Kp, velocity via Kv),
+  // so clamping any one of them just moves the runaway to the next. Projecting
+  // err onto the observable subspace HERE closes all three at once.
+  // Zero arithmetic change when the guard is off: project_observable returns its
+  // argument bitwise for w = (1,1,1) and for an unscored scan.
+  if (this->degen_params_.enabled) {
+    const Eigen::Vector3f err_raw = err;
+    err = dlio::degeneracy::project_observable(err, this->degen_w_);
+    err = dlio::degeneracy::clamp_innovation(err, this->degen_params_.innov_max_m);
+    const double removed = (err_raw - err).norm();
+    this->degen_removed_ = removed;
+    if (removed > 0.) ++this->degen_applied_;
+  } else {
+    this->degen_removed_ = 0.;
+  }
+  // --- end guard ------------------------------------------------------------
+
   Eigen::Vector3f err_body;
 
   err_body = qhat.conjugate()._transformVector(err);
@@ -2249,6 +2390,27 @@ void dlio::OdomNode::debug() {
     << "Registration       :: keyframes: " + std::to_string(this->keyframes.size()) + ", "
                                + "deskewed points: " + std::to_string(this->deskew_size)
     << "|" << std::endl;
+
+  // GICP degeneracy: the per-scan flag and the smallest eigenvalue of the
+  // registration's translation information, so a run can be scored for
+  // degenerate scans straight from `docker logs` — the same instrument every
+  // other verdict on this bag came from. Always printed, so the line also
+  // identifies which image is running.
+  {
+    char degbuf[160];
+    if (!this->degen_params_.scoring()) {
+      snprintf(degbuf, sizeof(degbuf), "Degeneracy  :: off");
+    } else {
+      snprintf(degbuf, sizeof(degbuf),
+               "Degeneracy  :: F=%d lmin=%.3g deg=%ld/%ld ap=%ld (%s)",
+               (int)this->degen_flag_, (double)this->degen_lambda_min_,
+               (long)this->degen_degenerate_, (long)this->degen_scans_,
+               (long)this->degen_applied_,
+               this->degen_params_.enabled ? "guard" : "observe");
+    }
+    std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
+      << degbuf << "|" << std::endl;
+  }
   std::cout << "|                                                                   |" << std::endl;
 
   std::cout << std::right << std::setprecision(2) << std::fixed;

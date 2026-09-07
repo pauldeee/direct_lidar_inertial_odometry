@@ -11,6 +11,7 @@
  ***********************************************************/
 
 #include "dlio/dlio.h"
+#include "dlio/degeneracy.h"
 #include <ros/callback_queue.h>
 #include <ros/subscribe_options.h>
 #include <memory>
@@ -51,6 +52,8 @@ private:
   void initializeDLIO();
 
   void getNextPose();
+  void scoreDegeneracy();   // score this scan's GICP geometry; see dlio/degeneracy.h
+  void logDegeneracy();     // report it AFTER updateState, so `removed` is THIS scan's
   bool imuMeasFromTimeRange(double start_time, double end_time,
                             boost::circular_buffer<ImuMeas>::reverse_iterator& begin_imu_it,
                             boost::circular_buffer<ImuMeas>::reverse_iterator& end_imu_it);
@@ -394,5 +397,22 @@ private:
   double geo_Kgb_;
   double geo_abias_max_;
   double geo_gbias_max_;
+
+  // --- GICP degeneracy guard (slamlab) ---------------------------------------
+  dlio::degeneracy::Params  degen_params_;
+  dlio::degeneracy::Weights degen_w_;        // this scan's verdict; lidar-callback thread only
+
+  // Banner/telemetry. Written by the lidar callback, read by the debug thread —
+  // atomic so the banner never tears, same idiom as deskew_size.
+  std::atomic<bool>   degen_flag_;           // this scan was scored degenerate
+  std::atomic<double> degen_lambda_min_;     // smallest eigenvalue of H_tt this scan
+  std::atomic<double> degen_ratio_min_;      // lambda_min / lambda_max this scan
+  std::atomic<double> degen_w_min_;          // smallest observability weight this scan
+  std::atomic<double> degen_removed_;        // |err| removed from the observer THIS scan (metres)
+  std::atomic<long>   degen_scans_;          // scans scored
+  std::atomic<long>   degen_degenerate_;     // scans with w_min < 1          (COMPUTED)
+  std::atomic<long>   degen_applied_;        // scans where something was removed (APPLIED)
+  std::atomic<long>   degen_invalid_;        // scans refused (stale Hessian / too few corr.)
+  bool degen_noop_reported_;                 // one-shot silent-no-op complaint
 
 };

@@ -63,6 +63,7 @@ LsqRegistration<PointTarget, PointSource>::LsqRegistration() {
   lm_lambda_ = -1.0;
 
   final_hessian_.setIdentity();
+  final_hessian_valid_ = false;
   final_error_ = 0.;
 }
 
@@ -100,6 +101,11 @@ const Eigen::Matrix<double, 6, 6>& LsqRegistration<PointTarget, PointSource>::ge
 }
 
 template <typename PointTarget, typename PointSource>
+bool LsqRegistration<PointTarget, PointSource>::hasFinalHessian() const {
+  return final_hessian_valid_;
+}
+
+template <typename PointTarget, typename PointSource>
 double LsqRegistration<PointTarget, PointSource>::getFinalError() const {
   return final_error_;
 }
@@ -110,6 +116,8 @@ void LsqRegistration<PointTarget, PointSource>::computeTransformation(PointCloud
 
   lm_lambda_ = -1.0;
   converged_ = false;
+  // Stale until this call actually accepts a step and writes a Hessian.
+  final_hessian_valid_ = false;
 
   if (lm_debug_print_) {
     std::cout << "********************************************" << std::endl;
@@ -172,6 +180,7 @@ bool LsqRegistration<PointTarget, PointSource>::step_gn(Eigen::Isometry3d& x0, E
 
   x0 = delta * x0;
   final_hessian_ = H;
+  final_hessian_valid_ = true;
   final_error_ = y0;
 
   return true;
@@ -221,6 +230,7 @@ bool LsqRegistration<PointTarget, PointSource>::step_lm(Eigen::Isometry3d& x0, E
     x0 = xi;
     lm_lambda_ = lm_lambda_ * std::max(1.0 / 3.0, 1 - std::pow(2 * rho - 1, 3));
     final_hessian_ = H;
+    final_hessian_valid_ = true;
     final_error_ = yi;
     return true;
   }
