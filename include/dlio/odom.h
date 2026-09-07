@@ -405,14 +405,27 @@ private:
   // Banner/telemetry. Written by the lidar callback, read by the debug thread —
   // atomic so the banner never tears, same idiom as deskew_size.
   std::atomic<bool>   degen_flag_;           // this scan was scored degenerate
-  std::atomic<double> degen_lambda_min_;     // smallest eigenvalue of H_tt this scan
   std::atomic<double> degen_ratio_min_;      // lambda_min / lambda_max this scan
   std::atomic<double> degen_w_min_;          // smallest observability weight this scan
   std::atomic<double> degen_removed_;        // |err| removed from the observer THIS scan (metres)
+  // Cumulative |err_raw - err|, metres, over the whole run. degen_removed_ is
+  // per-scan and degen_applied_ counts SCANS, so neither can answer the one
+  // question a finished run has to answer: HOW MUCH correction authority did the
+  // guard take away in total? One atomic add per scan buys that number.
+  std::atomic<double> degen_removed_total_;
   std::atomic<long>   degen_scans_;          // scans scored
   std::atomic<long>   degen_degenerate_;     // scans with w_min < 1          (COMPUTED)
   std::atomic<long>   degen_applied_;        // scans where something was removed (APPLIED)
   std::atomic<long>   degen_invalid_;        // scans refused (stale Hessian / too few corr.)
-  bool degen_noop_reported_;                 // one-shot silent-no-op complaint
+  bool degen_noop_reported_;                 // one-shot silent-no-op complaint (armed, nothing applied)
+  bool degen_blind_reported_;                // one-shot complaint: armed, nothing ever SCORED degenerate
+
+  // stdout is one buffer. logDegeneracy() printf+fflush runs on the lidar
+  // callback thread while debug() writes the status banner field by field with
+  // std::cout from a DETACHED thread per scan; with sync_with_stdio they share
+  // stdio's buffer, so a [DEGEN] flush can split a banner line in two — and that
+  // banner is the instrument every verdict on the Sandland bag was read from.
+  // Both printers take this lock, and so do two overlapping banners.
+  std::mutex print_mutex_;
 
 };

@@ -28,6 +28,19 @@ struct Params {
   double min_ratio     = 0.02;   // tau_lo: lambda_k/lambda_max below this => w=0 (unobservable)
   double full_ratio    = 0.10;   // tau_hi: above this => w=1; smoothstep in between
   int    max_weak_dirs = 1;      // never down-weight more than this many of the 3 directions
+  // FLOOR on the observability weight. w = 0 does not merely ignore a bad
+  // measurement: it disconnects the axis from every correction updateState()
+  // makes, so state.p, state.v AND state.b.accel receive nothing along u_min and
+  // that axis becomes a FREE DOUBLE INTEGRATOR for as long as the direction stays
+  // weak. On the big Sandland corridor that is ~780 s: a 0.05-0.1 deg residual
+  // attitude error leaks 0.009-0.017 m/s^2 of gravity into the axis, and
+  // 0.5*a*t^2 is 250 m to 5 km of drift (|v| reaching 7-13 m/s). Zhang/Kaess/Singh
+  // remapping gets away with w = 0 because a LOAM degeneracy lasts seconds.
+  // innov_max_m does NOT bound this: it clamps the magnitude of err, not the
+  // integrated drift. Only a PARTIAL weight can produce the bounded linear drift
+  // this guard claims as its success state, so the weakest direction keeps
+  // min_weight of its authority. Set 0.0 only for a deliberate remapping arm.
+  double min_weight    = 0.25;   // w_min floor for the down-weighted directions
   int    min_corr      = 200;    // fewer correspondences than this => refuse to judge (w=1)
   bool   guard_pose    = false;  // also guard the GICP translation increment (T / T_corr)
   double innov_max_m   = 0.0;    // 0 = off; else clamp |err| to this many metres
@@ -63,6 +76,23 @@ inline double smoothstep(double r, double lo, double hi) {
   if (r >= hi) return 1.0;
   const double t = (r - lo) / (hi - lo);
   return t * t * (3.0 - 2.0 * t);
+}
+
+// The TRANSLATION block of a 6x6 GICP Hessian, [rot(0..2) | trans(3..5)].
+//
+// nano_gicp::NanoGICP::linearize builds dtdx0 with
+//   dtdx0.block<3,3>(0,0) = skew(R p_A + t)   (rotation columns 0..2)
+//   dtdx0.block<3,3>(0,3) = -Identity         (translation columns 3..5)
+// (src/nano_gicp/nano_gicp.cc:280-281), so H = sum J^T M J puts the translation
+// information at block (3,3) — and because M_i = (cov_B + T cov_A T^T)^-1 with
+// BOTH clouds already in the global frame (dlio::OdomNode::getNextPose sets the
+// source and target from global-frame clouds), that block is in the SAME frame
+// as the observer error err = pin - state.p. Nothing needs rotating.
+//
+// It is a one-liner and it is still a function: the choice of block, not the
+// arithmetic, is the part that can be silently wrong, and here a test can pin it.
+inline Eigen::Matrix3d translation_information(const Eigen::Matrix<double, 6, 6>& H) {
+  return H.block<3, 3>(3, 3);
 }
 
 // Score the translation block of the GICP Hessian.
@@ -103,13 +133,22 @@ inline Weights degeneracy_weights(const Eigen::Matrix3d& Htt,
 
   W.valid = true;
   const int maxweak = std::max(0, std::min(3, p.max_weak_dirs));
+  const double wfloor = std::min(1.0, std::max(0.0, p.min_weight));
   for (int k = 0; k < 3; ++k) {
     const double lk = std::max(0.0, W.lambda(k));
     W.ratio(k) = lk / lmax;
     // Only the maxweak WEAKEST directions may be down-weighted; the eigenvalues
     // are ascending so those are exactly indices 0 .. maxweak-1. Zeroing all
     // three would hand the whole pose to dead reckoning.
-    W.w(k) = (k < maxweak) ? smoothstep(W.ratio(k), p.min_ratio, p.full_ratio) : 1.0;
+    //
+    // The floor is applied AFTER the ramp, so the guard can attenuate an
+    // unobservable direction but never disconnect it (see Params::min_weight).
+    // min_weight = 1 therefore reproduces stock DLIO exactly and reports weak=0,
+    // which keeps the silent-no-op pairing honest instead of raising a false
+    // alarm about a guard the operator asked to do nothing.
+    W.w(k) = (k < maxweak)
+                 ? std::max(wfloor, smoothstep(W.ratio(k), p.min_ratio, p.full_ratio))
+                 : 1.0;
     if (W.w(k) < 1.0) ++W.weak;
   }
   return W;

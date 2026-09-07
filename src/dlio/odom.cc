@@ -127,15 +127,16 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
 
   // GICP degeneracy guard telemetry
   this->degen_flag_ = false;
-  this->degen_lambda_min_ = 0.;
   this->degen_ratio_min_ = 1.;
   this->degen_w_min_ = 1.;
   this->degen_removed_ = 0.;
+  this->degen_removed_total_ = 0.;
   this->degen_scans_ = 0;
   this->degen_degenerate_ = 0;
   this->degen_applied_ = 0;
   this->degen_invalid_ = 0;
   this->degen_noop_reported_ = false;
+  this->degen_blind_reported_ = false;
 
   this->convex_hull.setDimension(3);
   this->concave_hull.setDimension(3);
@@ -396,6 +397,12 @@ void dlio::OdomNode::getParams() {
   ros::param::param<double>("~dlio/odom/gicp/degeneracy/min_ratio",     this->degen_params_.min_ratio,     0.02);
   ros::param::param<double>("~dlio/odom/gicp/degeneracy/full_ratio",    this->degen_params_.full_ratio,    0.10);
   ros::param::param<int>   ("~dlio/odom/gicp/degeneracy/max_weak_dirs", this->degen_params_.max_weak_dirs, 1);
+  // The weight FLOOR. Defaults to 0.25, not 0: w = 0 hands the weak axis to a
+  // free double integrator for the whole degenerate stretch (780 s on the
+  // Sandland corridor) with no substitute constraint anywhere in DLIO, which is
+  // hundreds of metres of drift, not the bounded linear drift this guard claims.
+  // See dlio/degeneracy.h. 0.0 = literal solution remapping, opt in deliberately.
+  ros::param::param<double>("~dlio/odom/gicp/degeneracy/min_weight",    this->degen_params_.min_weight,    0.25);
   ros::param::param<int>   ("~dlio/odom/gicp/degeneracy/min_corr",      this->degen_params_.min_corr,      200);
   ros::param::param<bool>  ("~dlio/odom/gicp/degeneracy/guard_pose",    this->degen_params_.guard_pose,    false);
   ros::param::param<double>("~dlio/odom/gicp/degeneracy/innov_max_m",   this->degen_params_.innov_max_m,   0.0);
@@ -1336,7 +1343,10 @@ void dlio::OdomNode::scoreDegeneracy() {
   // the scans whose LM never accepted a step, where final_hessian_ still holds
   // the PREVIOUS scan's geometry.
   const Eigen::Matrix<double,6,6>& H = this->gicp.getFinalHessian();
-  const Eigen::Matrix3d Htt = H.block<3,3>(3,3);
+  // Which 3x3 block is the TRANSLATION information lives in degeneracy.h, where
+  // a unit test can assert it against a 6x6 whose two blocks differ (picking the
+  // rotation block at (0,0) by mistake scores radians, silently).
+  const Eigen::Matrix3d Htt = dlio::degeneracy::translation_information(H);
 
   this->degen_w_ = dlio::degeneracy::degeneracy_weights(
       Htt, this->gicp.hasFinalHessian(), this->gicp.num_correspondences, this->degen_params_);
@@ -1347,7 +1357,6 @@ void dlio::OdomNode::scoreDegeneracy() {
   if (W.degenerate()) ++this->degen_degenerate_;
 
   this->degen_flag_       = W.degenerate();
-  this->degen_lambda_min_ = W.valid ? W.lambda_min() : 0.;
   this->degen_ratio_min_  = W.valid ? W.ratio_min()  : 1.;
   this->degen_w_min_      = W.w_min();
 
@@ -1364,21 +1373,34 @@ void dlio::OdomNode::logDegeneracy() {
   const int every = std::max(1, this->degen_params_.log_every);
   if ((this->degen_scans_ % every) == 0) {
     const Eigen::Vector3d u = W.U.col(0);
+    // The thresholds are printed on every line ON PURPOSE: an r/w pair cannot be
+    // read without them, and a line copied into a report with the band left
+    // implicit is how a forced-threshold smoke run gets mistaken for what the
+    // defaults do. `rm` is this scan's metres, `RM` the run's cumulative total.
+    // Under print_mutex_ so a flush cannot land inside a status-banner line.
+    std::lock_guard<std::mutex> print_lock(this->print_mutex_);
     printf("[DEGEN] t=%.4f valid=%d ncorr=%d lam=%.6g %.6g %.6g r=%.6f %.6f %.6f "
-           "w=%.4f %.4f %.4f u_min=(%.4f,%.4f,%.4f) weak=%d removed=%.6f "
+           "w=%.4f %.4f %.4f u_min=(%.4f,%.4f,%.4f) weak=%d rm=%.6f RM=%.4f "
+           "tau=%.4f/%.4f wfloor=%.3f mode=%s "
            "n=%ld deg=%ld app=%ld inv=%ld\n",
            this->scan_stamp, (int)W.valid, W.ncorr,
            W.lambda(0), W.lambda(1), W.lambda(2),
            W.ratio(0), W.ratio(1), W.ratio(2),
            W.w(0), W.w(1), W.w(2),
-           u(0), u(1), u(2), W.weak, (double)this->degen_removed_,
+           u(0), u(1), u(2), W.weak,
+           (double)this->degen_removed_, (double)this->degen_removed_total_,
+           this->degen_params_.min_ratio, this->degen_params_.full_ratio,
+           this->degen_params_.min_weight,
+           this->degen_params_.enabled ? "guard" : "observe",
            (long)this->degen_scans_, (long)this->degen_degenerate_,
            (long)this->degen_applied_, (long)this->degen_invalid_);
     fflush(stdout);
   }
 
-  // SILENT NO-OP LAW: computed > 0 while applied == 0 is a HARD ERROR, not a
-  // quiet success. Complain once, loudly, on stderr so it survives docker logs.
+  // SILENT NO-OP LAW, both directions.
+  //
+  // (a) COMPUTED > 0 while APPLIED == 0: the guard scored degenerate scans and
+  //     changed nothing. Hard error.
   if (this->degen_params_.enabled && !this->degen_noop_reported_ &&
       this->degen_degenerate_ > 100 && this->degen_applied_ == 0) {
     this->degen_noop_reported_ = true;
@@ -1387,6 +1409,29 @@ void dlio::OdomNode::logDegeneracy() {
             "observer error was never modified (applied=0). The guard is a no-op — "
             "check that dlio/odom/gicp/degeneracy/enabled reached the node.\n",
             (long)this->degen_degenerate_);
+    fflush(stderr);
+  }
+
+  // (b) The COMPLEMENTARY no-op, which is the more probable one: armed, running,
+  //     and nothing ever scored degenerate — because min_ratio is below the
+  //     Hessian's own floor, max_weak_dirs is 0, min_corr refuses every scan, or
+  //     (most likely) the yaml never reached the node, since these parameters can
+  //     only arrive through a SHALLOW-merged JSON blob. deg=0/N and a silent run
+  //     look exactly like a healthy scene, so say which it is. 1,000 scans =
+  //     100 s of a 10 Hz sensor, well past the Sandland corridor entry at 137.9 s
+  //     only if the corridor is there at all — hence the wording.
+  if (this->degen_params_.enabled && !this->degen_blind_reported_ &&
+      this->degen_scans_ > 1000 && this->degen_degenerate_ == 0) {
+    this->degen_blind_reported_ = true;
+    fprintf(stderr,
+            "[DEGEN][WARN] guard enabled for %ld scans (%ld refused) and NOT ONE was "
+            "scored degenerate. Either the geometry never degenerated, or the guard "
+            "cannot see it: check the r column against min_ratio=%.4f/full_ratio=%.4f, "
+            "max_weak_dirs=%d, min_corr=%d, and that these values reached the node "
+            "(rosparam dump /robot/dlio_odom), not just the recipe row.\n",
+            (long)this->degen_scans_, (long)this->degen_invalid_,
+            this->degen_params_.min_ratio, this->degen_params_.full_ratio,
+            this->degen_params_.max_weak_dirs, this->degen_params_.min_corr);
     fflush(stderr);
   }
 }
@@ -1727,6 +1772,9 @@ void dlio::OdomNode::updateState() {
     err = dlio::degeneracy::clamp_innovation(err, this->degen_params_.innov_max_m);
     const double removed = (err_raw - err).norm();
     this->degen_removed_ = removed;
+    // Cumulative metres of correction authority removed — the number that says
+    // whether the guard did too much or too little over the whole run.
+    this->degen_removed_total_ = this->degen_removed_total_.load() + removed;
     if (removed > 0.) ++this->degen_applied_;
   } else {
     this->degen_removed_ = 0.;
@@ -2292,7 +2340,15 @@ void dlio::OdomNode::debug() {
   double avg_cpu_usage =
     std::accumulate(this->cpu_percents.begin(), this->cpu_percents.end(), 0.0) / this->cpu_percents.size();
 
-  // Print to terminal
+  // Print to terminal.
+  //
+  // The banner is emitted field by field from a DETACHED thread spawned per scan,
+  // so two banners can interleave with each other and a [DEGEN] flush from the
+  // lidar thread can land inside a line. This banner is the instrument every
+  // verdict on the Sandland bag was read from, so both printers serialize on
+  // print_mutex_; the lock is held to the end of the function.
+  std::lock_guard<std::mutex> print_lock(this->print_mutex_);
+
   printf("\033[2J\033[1;1H");
 
   std::cout << std::endl
@@ -2397,17 +2453,30 @@ void dlio::OdomNode::debug() {
   // other verdict on this bag came from. Always printed, so the line also
   // identifies which image is running.
   {
+    // The box interior is 66 columns. This line is the only one here whose
+    // length grows with the run (deg=11398/11398 ap=11398 rm=1234.5), so it is
+    // hard-truncated: setw(66) only PADS, it never trims, and an over-long
+    // string walks the right border out late in a long run — exactly when the
+    // banner is being read most carefully.
+    //
+    // lmin was dropped in favour of the RATIO: the guard's own README explains
+    // that the Hessian's absolute scale is meaningless under PLANE
+    // regularization, so an eigenvalue on the banner invites the wrong
+    // comparison. r is what the thresholds are applied to, w is what came out,
+    // and rm is the cumulative metres of correction authority removed.
     char degbuf[160];
     if (!this->degen_params_.scoring()) {
       snprintf(degbuf, sizeof(degbuf), "Degeneracy  :: off");
     } else {
       snprintf(degbuf, sizeof(degbuf),
-               "Degeneracy  :: F=%d lmin=%.3g deg=%ld/%ld ap=%ld (%s)",
-               (int)this->degen_flag_, (double)this->degen_lambda_min_,
+               "Degen(%s) :: F=%d r=%.4f w=%.2f d=%ld/%ld a=%ld rm=%.1f",
+               this->degen_params_.enabled ? "guard" : "obs",
+               (int)this->degen_flag_, (double)this->degen_ratio_min_,
+               (double)this->degen_w_min_,
                (long)this->degen_degenerate_, (long)this->degen_scans_,
-               (long)this->degen_applied_,
-               this->degen_params_.enabled ? "guard" : "observe");
+               (long)this->degen_applied_, (double)this->degen_removed_total_);
     }
+    degbuf[66] = '\0';   // buffer is 160, so this only ever SHORTENS
     std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
       << degbuf << "|" << std::endl;
   }
