@@ -13,6 +13,7 @@
 #include "dlio/dlio.h"
 #include "dlio/degeneracy.h"
 #include "dlio/imu_delivery.h"
+#include "dlio/resume.h"
 #include <ros/callback_queue.h>
 #include <ros/subscribe_options.h>
 #include <memory>
@@ -32,6 +33,7 @@ private:
   struct ImuMeas;
 
   void getParams();
+  void applyResume();
 
   void callbackPointCloud(const sensor_msgs::PointCloud2ConstPtr& pc);
   void callbackImu(const sensor_msgs::Imu::ConstPtr& imu);
@@ -453,5 +455,28 @@ private:
   std::atomic<double> imu_rx_hz_;
   std::atomic<double> imu_rx_maxdt_;
   std::atomic<long>   imu_rx_gaps_;
+
+  // --- RESUME: starting in the middle of a run, from frozen priors ----------
+  //
+  // Stock DLIO starts at rest at t0 and derives attitude + biases from a 3 s
+  // static window. A run picked up mid-bag cannot do that (resume.h says what
+  // each way of getting it wrong costs), so it is TOLD instead -- and, because
+  // an override that never arrives is indistinguishable from one that did, it
+  // is told TWICE: once as the values themselves, once as `resume/expect/*`,
+  // which is what the node checks its own state against before it will run.
+  bool resume_enabled_;                      // dlio/resume/enabled
+  std::string resume_sentinel_;              // dlio/resume/sentinel, echoed for the host
+  dlio::resume::Seed resume_seed_;           // attitude / position / velocity, WORLD
+  bool resume_expect_calibration_off_;       // what the dispatcher says it sent
+  Eigen::Vector3f resume_expect_accel_bias_; // m/s^2, BASELINK
+  Eigen::Vector3f resume_expect_gyro_bias_;  // rad/s, BASELINK
+  double resume_tol_;                        // how far applied may sit from requested
+  std::string resume_line_;                  // the one-shot [RESUME] record, for [DEGEN]
+  // The biases and attitude this run STARTED from, frozen at the moment the
+  // init completed. state.b is live and drifts (on the big Sandland bag it
+  // ratcheted to the +-0.3 rail), so it cannot answer "what did this run start
+  // with?" ten minutes in -- and that is the question a resume is judged on.
+  Eigen::Vector3f resume_init_accel_bias_;   // m/s^2, BASELINK
+  Eigen::Vector3f resume_init_gyro_bias_;    // rad/s, BASELINK
 
 };

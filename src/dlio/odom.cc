@@ -184,6 +184,15 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
   this->geo.first_opt_done = false;
   this->geo.prev_vel = Eigen::Vector3f(0., 0., 0.);
 
+  // Seed the state from the parent run, or die saying which value did not
+  // arrive. AFTER every zero-initialisation above -- this is what overwrites
+  // them -- and before GICP is configured, because keyframe 0 is built from
+  // this->T and lidarPose.
+  this->resume_line_ = "";
+  this->resume_init_accel_bias_ = this->state.b.accel;
+  this->resume_init_gyro_bias_ = this->state.b.gyro;
+  this->applyResume();
+
   pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
 
   this->crop.setNegative(true);
@@ -386,6 +395,65 @@ void dlio::OdomNode::getParams() {
     this->imu_accel_sm_ = Eigen::Matrix3f::Identity();
   }
 
+  // --- RESUME (slamlab): what a run that starts mid-bag has to be told ------
+  //
+  // Read AFTER the block above on purpose: everything here is a statement about
+  // what that block did, and it can only be checked once it has run.
+  //
+  // `expect/*` is not a duplicate of the values. It is the dispatcher saying
+  // "this is what I put in the override yaml", so the node can compare it with
+  // what it actually READ and refuse when the two differ. That is the only way
+  // to catch a parameter that was shadowed by a launch-file <param> tag (N58),
+  // or an override file that never rendered, or a key written under the wrong
+  // namespace -- each of which otherwise produces a run that looks perfectly
+  // healthy and is silently NOT the run that was asked for.
+  ros::param::param<bool>("~dlio/resume/enabled", this->resume_enabled_, false);
+  ros::param::param<std::string>("~dlio/resume/sentinel", this->resume_sentinel_, std::string(""));
+  ros::param::param<double>("~dlio/resume/tolerance", this->resume_tol_, dlio::resume::APPLIED_TOL);
+
+  std::vector<float> q_default{1., 0., 0., 0.};   // w, x, y, z (WORLD <- BASELINK)
+  std::vector<float> v3_default{0., 0., 0.};
+  std::vector<float> res_q, res_p, res_v, exp_ab, exp_gb;
+  ros::param::param<std::vector<float>>("~dlio/resume/initial/attitude", res_q, q_default);
+  ros::param::param<std::vector<float>>("~dlio/resume/initial/position", res_p, v3_default);
+  ros::param::param<std::vector<float>>("~dlio/resume/initial/velocity_w", res_v, v3_default);
+  ros::param::param<std::vector<float>>("~dlio/resume/expect/accel_bias", exp_ab, v3_default);
+  ros::param::param<std::vector<float>>("~dlio/resume/expect/gyro_bias", exp_gb, v3_default);
+  ros::param::param<bool>("~dlio/resume/expect/calibration_off",
+                          this->resume_expect_calibration_off_, false);
+
+  // has() rather than "differs from the default": a deliberate zero and an
+  // absent key are the same four bytes, and only one of them is an error.
+  const bool have_q = ros::param::has("~dlio/resume/initial/attitude") && res_q.size() == 4;
+  const bool have_p = ros::param::has("~dlio/resume/initial/position") && res_p.size() == 3;
+  const bool have_v = ros::param::has("~dlio/resume/initial/velocity_w") && res_v.size() == 3;
+
+  this->resume_seed_ = dlio::resume::make_seed(
+      have_q, have_q ? Eigen::Quaternionf(res_q[0], res_q[1], res_q[2], res_q[3])
+                     : Eigen::Quaternionf(1.f, 0.f, 0.f, 0.f),
+      have_p, have_p ? Eigen::Vector3f(res_p[0], res_p[1], res_p[2]) : Eigen::Vector3f::Zero(),
+      have_v, have_v ? Eigen::Vector3f(res_v[0], res_v[1], res_v[2]) : Eigen::Vector3f::Zero());
+  this->resume_expect_accel_bias_ = exp_ab.size() == 3
+      ? Eigen::Vector3f(exp_ab[0], exp_ab[1], exp_ab[2]) : Eigen::Vector3f::Zero();
+  this->resume_expect_gyro_bias_ = exp_gb.size() == 3
+      ? Eigen::Vector3f(exp_gb[0], exp_gb[1], exp_gb[2]) : Eigen::Vector3f::Zero();
+
+  // HALF A RESUME IS WORSE THAN NONE. If the seeds or the expectations arrived
+  // but `enabled` did not, the override yaml reached the node in pieces: the
+  // run would calibrate itself on a moving rig while carrying a pickup pose it
+  // never applied, and every artifact would say "normal run". Refuse.
+  if (!this->resume_enabled_ &&
+      (have_q || have_p || have_v ||
+       ros::param::has("~dlio/resume/expect/accel_bias") ||
+       ros::param::has("~dlio/resume/expect/calibration_off"))) {
+    ROS_FATAL("[RESUME][ERROR] dlio/resume/* parameters are present but "
+              "dlio/resume/enabled is FALSE -- the override reached this node "
+              "in pieces. Refusing to run: a half-applied resume is a normal-"
+              "looking run in the wrong frame.");
+    std::cout.flush();
+    std::exit(21);
+  }
+
   // GICP
   ros::param::param<int>("~dlio/odom/gicp/minNumPoints", this->gicp_min_num_points_, 100);
   ros::param::param<int>("~dlio/odom/gicp/kCorrespondences", this->gicp_k_correspondences_, 20);
@@ -430,6 +498,120 @@ void dlio::OdomNode::getParams() {
   ros::param::param<int>   ("~dlio/odom/gicp/degeneracy/log_every",     this->degen_params_.log_every,     1);
 
   ros::param::param<bool>("~dlio/verbose", this->verbose, true);
+}
+
+// RESUME: apply the frozen priors and the pickup state, or refuse to run.
+//
+// Called from the constructor after every zero-initialisation and before GICP
+// is configured. Three jobs, in this order, because each depends on the last:
+//
+//   1. CHECK. Compare what the dispatcher says it sent (dlio/resume/expect/*)
+//      with what getParams actually read into this node's state. A resume whose
+//      priors were shadowed produces a healthy-looking run in a frame nobody
+//      chose, so a mismatch is FATAL here rather than a warning nobody reads
+//      after a 40-minute replay. This is the silent-no-op law's resume instance.
+//   2. SEED. state.q/p/v, T, lidarPose and geo.prev_vel -- eight members that
+//      stock DLIO can only ever leave at zero. geo.prev_vel is the one that
+//      actually bites: the second scan's IMU prior and its deskew integrate from
+//      it, not from state.v.
+//   3. SAY SO. One [RESUME] record carrying every effective init value with its
+//      units, kept in resume_line_ so the status banner and every [DEGEN] line
+//      repeat it. An init that is only visible by its ABSENCE from the log (the
+//      calibration banner simply not printing) is not a report.
+void dlio::OdomNode::applyResume() {
+
+  if (!this->resume_enabled_) return;
+
+  // 1. CHECK
+  const std::vector<dlio::resume::Mismatch> bad = dlio::resume::verify(
+      this->resume_expect_calibration_off_, !this->imu_calibrate_,
+      this->resume_expect_accel_bias_, this->state.b.accel,
+      this->resume_expect_gyro_bias_, this->state.b.gyro,
+      this->imu_accel_sm_, this->resume_seed_, this->resume_tol_);
+
+  if (!bad.empty()) {
+    std::lock_guard<std::mutex> print_lock(this->print_mutex_);
+    printf("[RESUME][ERROR] %ld requested init value(s) are NOT what this node "
+           "is running with. sentinel=%s\n",
+           (long)bad.size(), this->resume_sentinel_.c_str());
+    for (size_t i = 0; i < bad.size(); ++i) {
+      printf("[RESUME][ERROR]   %s requested=%.8f effective=%.8f  (%s)\n",
+             bad[i].key.c_str(), bad[i].requested, bad[i].effective,
+             bad[i].note.c_str());
+    }
+    printf("[RESUME][ERROR] os0.launch sets seven dlio keys with <param> tags, "
+           "and roslaunch flushes a node's <param> tags to the parameter server "
+           "AFTER every <rosparam file> in the same node (xmlloader.py:415/425) "
+           "-- so a <param> tag beats the per-run override yaml whatever the "
+           "document order. Check the LIVE dump: rosparam get /<ns>/dlio_odom\n");
+    printf("[RESUME][ERROR] refusing to run.\n");
+    fflush(stdout);
+    std::exit(22);
+  }
+
+  // 2. SEED
+  if (this->resume_seed_.have_attitude) {
+    this->state.q = this->resume_seed_.q;
+    this->T.block(0,0,3,3) = this->state.q.toRotationMatrix();
+    this->lidarPose.q = this->state.q;
+  }
+  if (this->resume_seed_.have_position) {
+    this->state.p = this->resume_seed_.p;
+    this->T.block(0,3,3,1) = this->state.p;
+    this->lidarPose.p = this->state.p;
+    // origin only feeds the banner's "Distance to Origin"; moving it with the
+    // seed keeps that number meaning what it says.
+    this->origin = this->state.p;
+  }
+  if (this->resume_seed_.have_velocity) {
+    this->state.v.lin.w = this->resume_seed_.v_w;
+    this->state.v.lin.b = dlio::resume::body_velocity(this->state.q,
+                                                      this->resume_seed_.v_w);
+    // THE ONE THAT BITES. integrateImu() is handed geo.prev_vel, not state.v:
+    // leaving it at zero starts the child from a standstill it is not in, and
+    // the first IMU prior is wrong by the whole pickup speed.
+    this->geo.prev_vel = this->resume_seed_.v_w;
+  }
+
+  // 3. SAY SO
+  this->resume_init_accel_bias_ = this->state.b.accel;
+  this->resume_init_gyro_bias_ = this->state.b.gyro;
+  const double tilt_deg =
+      dlio::resume::tilt_from_gravity_rad(this->state.q) * 180.0 / M_PI;
+  const double sm_err =
+      (this->imu_accel_sm_ - Eigen::Matrix3f::Identity()).cwiseAbs().maxCoeff();
+  char buf[1024];
+  snprintf(buf, sizeof(buf),
+           "resume=1 sentinel=%s init_mode=%s seeded=%s "
+           "b_accel=%.8f,%.8f,%.8f b_gyro=%.8f,%.8f,%.8f sm_is_identity=%d "
+           "q_init=%.6f,%.6f,%.6f,%.6f p_init=%.4f,%.4f,%.4f "
+           "v_init_w=%.4f,%.4f,%.4f tilt_deg=%.4f grav=%.5f "
+           "units=b_accel:m_per_s2;b_gyro:rad_per_s;p:m;v:m_per_s;"
+           "q:wxyz_world_from_baselink;tilt:deg;grav:m_per_s2",
+           this->resume_sentinel_.empty() ? "-" : this->resume_sentinel_.c_str(),
+           this->imu_calibrate_ ? "calibrated" : "priors",
+           this->resume_seed_.describe().c_str(),
+           this->state.b.accel[0], this->state.b.accel[1], this->state.b.accel[2],
+           this->state.b.gyro[0], this->state.b.gyro[1], this->state.b.gyro[2],
+           (int)(sm_err <= this->resume_tol_),
+           this->state.q.w(), this->state.q.x(), this->state.q.y(), this->state.q.z(),
+           this->state.p[0], this->state.p[1], this->state.p[2],
+           this->state.v.lin.w[0], this->state.v.lin.w[1], this->state.v.lin.w[2],
+           tilt_deg, this->gravity_);
+  {
+    std::lock_guard<std::mutex> print_lock(this->print_mutex_);
+    this->resume_line_ = buf;
+    printf("[RESUME] %s\n", buf);
+    // The seam this costs, stated once so nobody has to rediscover it: the
+    // first accepted scan becomes keyframe 0 and is published as no pose at
+    // all, and it is transformed rigidly rather than deskewed (there is no
+    // previous scan to integrate from). One scan, and one sweep of smear on the
+    // cloud the child registers its first submap against.
+    printf("[RESUME] seam: the first accepted scan becomes keyframe 0 -- no odom "
+           "message, and rigidly transformed rather than deskewed. Overlap the "
+           "parent by enough that this lands where the parent already looked.\n");
+    fflush(stdout);
+  }
 }
 
 void dlio::OdomNode::start() {
@@ -1273,6 +1455,41 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::Imu::ConstPtr& imu_raw) {
 
       this->imu_calibrated = true;
 
+      // The same one-line record the resume path writes, for the mode that
+      // MEASURED its init instead of being told it. Without this the [DEGEN]
+      // line can say what a resumed run started from and not what a normal run
+      // started from, which makes the two uncomparable at exactly the moment
+      // somebody is trying to compare them.
+      {
+        this->resume_init_accel_bias_ = this->state.b.accel;
+        this->resume_init_gyro_bias_ = this->state.b.gyro;
+        const double tilt_deg =
+            dlio::resume::tilt_from_gravity_rad(this->state.q) * 180.0 / M_PI;
+        const double sm_err =
+            (this->imu_accel_sm_ - Eigen::Matrix3f::Identity()).cwiseAbs().maxCoeff();
+        char cbuf[1024];
+        snprintf(cbuf, sizeof(cbuf),
+                 "resume=0 sentinel=- init_mode=calibrated seeded=none "
+                 "calib_s=%.1f b_accel=%.8f,%.8f,%.8f b_gyro=%.8f,%.8f,%.8f "
+                 "sm_is_identity=%d q_init=%.6f,%.6f,%.6f,%.6f "
+                 "p_init=%.4f,%.4f,%.4f v_init_w=%.4f,%.4f,%.4f "
+                 "tilt_deg=%.4f grav=%.5f "
+                 "units=b_accel:m_per_s2;b_gyro:rad_per_s;p:m;v:m_per_s;"
+                 "q:wxyz_world_from_baselink;tilt:deg;grav:m_per_s2",
+                 this->imu_calib_time_,
+                 this->state.b.accel[0], this->state.b.accel[1], this->state.b.accel[2],
+                 this->state.b.gyro[0], this->state.b.gyro[1], this->state.b.gyro[2],
+                 (int)(sm_err <= 1e-6),
+                 this->state.q.w(), this->state.q.x(), this->state.q.y(), this->state.q.z(),
+                 this->state.p[0], this->state.p[1], this->state.p[2],
+                 this->state.v.lin.w[0], this->state.v.lin.w[1], this->state.v.lin.w[2],
+                 tilt_deg, this->gravity_);
+        std::lock_guard<std::mutex> print_lock(this->print_mutex_);
+        this->resume_line_ = cbuf;
+        printf("[RESUME] %s\n", cbuf);
+        fflush(stdout);
+      }
+
     }
 
   } else {
@@ -1443,7 +1660,7 @@ void dlio::OdomNode::logDegeneracy() {
            "tau=%.4f/%.4f wfloor=%.3f mode=%s "
            "n=%ld deg=%ld app=%ld inv=%ld "
            "q_min=%.6g info=%.4f/%.4f innov=%.4f dp=%.4f "
-           "imu_rx=%ld imu_hz=%.3f imu_dtmax=%.4f imu_gaps=%ld\n",
+           "imu_rx=%ld imu_hz=%.3f imu_dtmax=%.4f imu_gaps=%ld init=[%s]\n",
            this->scan_stamp, (int)W.valid, W.ncorr,
            W.lambda(0), W.lambda(1), W.lambda(2),
            W.ratio(0), W.ratio(1), W.ratio(2),
@@ -1459,7 +1676,11 @@ void dlio::OdomNode::logDegeneracy() {
            this->degen_params_.min_info, this->degen_params_.full_info,
            (double)this->degen_innov_, (double)this->degen_dp_,
            (long)this->imu_rx_n_, (double)this->imu_rx_hz_,
-           (double)this->imu_rx_maxdt_, (long)this->imu_rx_gaps_);
+           (double)this->imu_rx_maxdt_, (long)this->imu_rx_gaps_,
+           // WHAT THIS RUN STARTED FROM, on every line that carries a verdict.
+           // Held under the same print_mutex_ this block already owns, which is
+           // also the lock callbackImu takes to write it.
+           this->resume_line_.empty() ? "pending" : this->resume_line_.c_str());
     fflush(stdout);
   }
 
@@ -2487,6 +2708,38 @@ void dlio::OdomNode::debug() {
          + std::to_string(rxn) + " msgs), dt max "
          + to_string_with_precision(rxdt * 1e3, 1) + " ms, gaps "
          + std::to_string(rxg)
+      << "|" << std::endl;
+  }
+
+  // WHERE THIS RUN'S FRAME AND BIASES CAME FROM. Two lines, on every banner,
+  // because the difference between a run that measured its init and a run that
+  // was handed one is invisible in every other field -- and when the answer is
+  // "handed one", the values themselves are the only evidence that the override
+  // survived the launch file. resume_line_ carries the same record with units,
+  // and this banner already holds print_mutex_, which is the lock that writes it.
+  {
+    const bool priors = !this->imu_calibrate_;
+    const double tilt_deg =
+        dlio::resume::tilt_from_gravity_rad(this->state.q) * 180.0 / M_PI;
+    std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
+      << "Init: " + std::string(priors ? "FROZEN PRIORS" : "measured (3 s static)")
+         + (this->resume_enabled_
+              ? " [RESUME seed " + this->resume_seed_.describe()
+                + (this->resume_sentinel_.empty()
+                     ? std::string("")
+                     : ", sentinel " + this->resume_sentinel_) + "]"
+              : std::string(""))
+      << "|" << std::endl;
+    std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
+      << "Init bias {B} a[m/s2] " + to_string_with_precision(this->resume_init_accel_bias_[0], 4)
+         + " " + to_string_with_precision(this->resume_init_accel_bias_[1], 4)
+         + " " + to_string_with_precision(this->resume_init_accel_bias_[2], 4)
+      << "|" << std::endl;
+    std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
+      << "Init bias {B} g[rad/s] " + to_string_with_precision(this->resume_init_gyro_bias_[0], 5)
+         + " " + to_string_with_precision(this->resume_init_gyro_bias_[1], 5)
+         + " " + to_string_with_precision(this->resume_init_gyro_bias_[2], 5)
+         + " | world tilt " + to_string_with_precision(tilt_deg, 3) + " deg"
       << "|" << std::endl;
   }
 
