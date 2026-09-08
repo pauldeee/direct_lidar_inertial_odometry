@@ -12,6 +12,7 @@
 
 #include "dlio/dlio.h"
 #include "dlio/degeneracy.h"
+#include "dlio/imu_delivery.h"
 #include <ros/callback_queue.h>
 #include <ros/subscribe_options.h>
 #include <memory>
@@ -436,5 +437,21 @@ private:
   // banner is the instrument every verdict on the Sandland bag was read from.
   // Both printers take this lock, and so do two overlapping banners.
   std::mutex print_mutex_;
+
+  // DELIVERED IMU — the transport witness this node never had.
+  //
+  // `imu_rates` + the banner's mean(1/dt) cannot see a dropped message
+  // (imu_delivery.h says why, with the numbers). These four say how much of the
+  // stream actually arrived: count over span, the worst interval, and how many
+  // intervals crossed imu_gap_s_. Written only by callbackImu, which roscpp
+  // serializes per subscription; mirrored into atomics because the status
+  // banner and the [DEGEN] line read them from other threads.
+  dlio::imu_delivery::Counter imu_rx_;
+  double imu_gap_s_;                         // what counts as a gap (seconds)
+  bool   imu_gap_reported_;                  // one-shot "this stream is lossy"
+  std::atomic<long>   imu_rx_n_;
+  std::atomic<double> imu_rx_hz_;
+  std::atomic<double> imu_rx_maxdt_;
+  std::atomic<long>   imu_rx_gaps_;
 
 };

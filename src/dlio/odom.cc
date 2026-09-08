@@ -125,6 +125,15 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
   this->elapsed_time = 0.;
   this->length_traversed;
 
+  // Delivered-IMU accounting (instrument; nothing reads it but the log)
+  this->imu_rx_ = dlio::imu_delivery::Counter();
+  this->imu_rx_.gap_s = this->imu_gap_s_;
+  this->imu_gap_reported_ = false;
+  this->imu_rx_n_ = 0;
+  this->imu_rx_hz_ = 0.;
+  this->imu_rx_maxdt_ = 0.;
+  this->imu_rx_gaps_ = 0;
+
   // GICP degeneracy guard telemetry
   this->degen_flag_ = false;
   this->degen_ratio_min_ = 1.;
@@ -343,6 +352,11 @@ void dlio::OdomNode::getParams() {
   // recorder launch sets these large for drop-free deterministic bag processing.
   ros::param::param<int>("~dlio/sub_pointcloud_queue", this->sub_pointcloud_queue_, 1);
   ros::param::param<int>("~dlio/sub_imu_queue", this->sub_imu_queue_, 1000);
+  // What counts as a GAP in the delivered IMU stream. 50 ms is the figure the
+  // big-bag IMU census counted 2,048 of (IMU_CHECK.md section 5), so the node's
+  // own report and that census are in the same unit and can be compared line
+  // for line. It changes no arithmetic: it only sets when the counter says so.
+  ros::param::param<double>("~dlio/odom/imu/gap_report_s", this->imu_gap_s_, 0.05);
 
   std::vector<float> accel_default{0., 0., 0.}; std::vector<float> prior_accel_bias;
   std::vector<float> gyro_default{0., 0., 0.}; std::vector<float> prior_gyro_bias;
@@ -1128,6 +1142,35 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::Imu::ConstPtr& imu_raw) {
   sensor_msgs::Imu::Ptr imu = this->transformImu( imu_raw );
   this->imu_stamp = imu->header.stamp;
 
+  // DELIVERED-IMU ACCOUNTING. Before the calibration branch, so the 3 s
+  // calibration window is inside the count: the question this answers is how
+  // much of the stream REACHED this node, and a sample consumed by calibration
+  // reached it. No arithmetic below reads any of this.
+  {
+    const bool gap = this->imu_rx_.note(imu->header.stamp.toSec());
+    this->imu_rx_n_     = this->imu_rx_.n;
+    this->imu_rx_hz_    = this->imu_rx_.hz();
+    this->imu_rx_maxdt_ = this->imu_rx_.max_dt;
+    this->imu_rx_gaps_  = this->imu_rx_.gaps;
+    // ONCE, on stderr, the moment the stream proves itself lossy. The banner
+    // averages and the [DEGEN] line is sampled; this fires on the first gap and
+    // names it, so a lossy transport cannot reach the end of a run unremarked.
+    // On a stream that is not losing messages it never prints at all -- which is
+    // what makes it evidence.
+    if (gap && !this->imu_gap_reported_) {
+      this->imu_gap_reported_ = true;
+      fprintf(stderr,
+              "[IMU][WARN] %.1f ms with no IMU sample, ending at t=%.4f (%ld "
+              "received so far, %.2f Hz delivered). The publisher feeding this "
+              "node is dropping messages: a mean-of-1/dt rate CANNOT see that, "
+              "so judge delivery by the count/span figure in the banner, not by "
+              "'Sensor Rates'. Threshold dlio/odom/imu/gap_report_s = %.3f s.\n",
+              this->imu_rx_.max_dt * 1e3, this->imu_rx_.max_dt_at,
+              (long)this->imu_rx_.n, this->imu_rx_.hz(), this->imu_gap_s_);
+      fflush(stderr);
+    }
+  }
+
   Eigen::Vector3f lin_accel;
   Eigen::Vector3f ang_vel;
 
@@ -1399,7 +1442,8 @@ void dlio::OdomNode::logDegeneracy() {
            "w=%.4f %.4f %.4f u_min=(%.4f,%.4f,%.4f) weak=%d rm=%.6f RM=%.4f "
            "tau=%.4f/%.4f wfloor=%.3f mode=%s "
            "n=%ld deg=%ld app=%ld inv=%ld "
-           "q_min=%.6g info=%.4f/%.4f innov=%.4f dp=%.4f\n",
+           "q_min=%.6g info=%.4f/%.4f innov=%.4f dp=%.4f "
+           "imu_rx=%ld imu_hz=%.3f imu_dtmax=%.4f imu_gaps=%ld\n",
            this->scan_stamp, (int)W.valid, W.ncorr,
            W.lambda(0), W.lambda(1), W.lambda(2),
            W.ratio(0), W.ratio(1), W.ratio(2),
@@ -1413,7 +1457,9 @@ void dlio::OdomNode::logDegeneracy() {
            (long)this->degen_applied_, (long)this->degen_invalid_,
            W.info(0),
            this->degen_params_.min_info, this->degen_params_.full_info,
-           (double)this->degen_innov_, (double)this->degen_dp_);
+           (double)this->degen_innov_, (double)this->degen_dp_,
+           (long)this->imu_rx_n_, (double)this->imu_rx_hz_,
+           (double)this->imu_rx_maxdt_, (long)this->imu_rx_gaps_);
     fflush(stdout);
   }
 
@@ -2423,6 +2469,24 @@ void dlio::OdomNode::debug() {
     std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
       << "Sensor Rates: Unknown LiDAR @ " + to_string_with_precision(avg_lidar_rate, 2)
                                           + " Hz, IMU @ " + to_string_with_precision(avg_imu_rate, 2) + " Hz"
+      << "|" << std::endl;
+  }
+
+  // THE LINE ABOVE IS A MEAN OF 1/dt AND CANNOT SEE A DROPPED MESSAGE.
+  // This one can: count over span, plus the worst interval and how many
+  // intervals crossed dlio/odom/imu/gap_report_s. On the big Sandland bag the
+  // line above read 632.44 Hz while this one would have read 471.95 -- the
+  // 26 % the transport was losing (imu_delivery.h, IMU_CHECK.md section 5).
+  {
+    const long   rxn  = this->imu_rx_n_;
+    const double rxhz = this->imu_rx_hz_;
+    const double rxdt = this->imu_rx_maxdt_;
+    const long   rxg  = this->imu_rx_gaps_;
+    std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
+      << "IMU delivered: " + to_string_with_precision(rxhz, 2) + " Hz ("
+         + std::to_string(rxn) + " msgs), dt max "
+         + to_string_with_precision(rxdt * 1e3, 1) + " ms, gaps "
+         + std::to_string(rxg)
       << "|" << std::endl;
   }
 
