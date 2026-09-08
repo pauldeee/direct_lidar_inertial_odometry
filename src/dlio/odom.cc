@@ -155,6 +155,8 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
   this->submap_short_refused_ = 0;
   this->submap_kcc_added_ = 0;
   this->submap_size_ = 0;
+  this->submap_dmax_ = 0.;
+  this->submap_dkcc_ = 0.;
   this->submap_refuse_reported_ = false;
   this->keyframe_age_fired_ = 0;
   this->keyframe_age_stale_ = 0;
@@ -1690,6 +1692,13 @@ void dlio::OdomNode::scoreDegeneracy() {
   this->degen_w_ = dlio::degeneracy::degeneracy_weights(
       Htt, this->gicp.hasFinalHessian(), this->gicp.num_correspondences, this->degen_params_);
 
+  // INSTRUMENT ONLY. The rotation block of the SAME Hessian, plus the whole
+  // 6x6's condition number. Nothing acts on it -- degen_w_ above is still built
+  // from the translation block alone and is the only thing updateState() sees.
+  // It is here because the corridor's r_min is a translation number while the
+  // onset is a heading error, and a column that does not exist cannot be fitted.
+  this->degen_rot_ = dlio::degeneracy::rotation_record(H, this->gicp.hasFinalHessian());
+
   const dlio::degeneracy::Weights& W = this->degen_w_;
   ++this->degen_scans_;
   if (!W.valid) ++this->degen_invalid_;
@@ -1727,11 +1736,16 @@ void dlio::OdomNode::logDegeneracy() {
            "n=%ld deg=%ld app=%ld inv=%ld "
            "q_min=%.6g info=%.4f/%.4f innov=%.4f dp=%.4f "
            "imu_rx=%ld imu_hz=%.3f imu_dtmax=%.4f imu_gaps=%ld "
-           "smsz=%d smkcc=%d smref=%ld kfage=%.2f kfn=%ld kfmax=%.2f kfmin=%.3f "
-           "abmax=%.4f,%.4f,%.4f abmrg=%.4f init=[%s] "
+           "smsz=%d smkcc=%d smref=%ld smdmax=%.2f smdkcc=%.2f "
+           "kfage=%.2f kfn=%ld kfmax=%.2f kfmin=%.3f "
+           "abmax=%.4f,%.4f,%.4f abmrg=%.4f "
+           "rvalid=%d rlam=%.6g %.6g %.6g rr=%.6f ru_min=(%.4f,%.4f,%.4f) cond6=%.6g "
+           "init=[%s] "
            "units=lam:corr_count;q:corr_count_per_corr;rm:m;innov:m;dp:m;"
            "imu_hz:Hz;imu_dtmax:s;smsz:keyframes;smkcc:indices;smref:lists;"
-           "kfage:s;kfn:keyframes;kfmax:s;kfmin:m;abmax:m_per_s2;abmrg:m_per_s2\n",
+           "smdmax:m;smdkcc:m;kfage:s;kfn:keyframes;kfmax:s;kfmin:m;"
+           "abmax:m_per_s2;abmrg:m_per_s2;rlam:corr_count_times_m2;rr:ratio;"
+           "cond6:MIXED_UNITS_relative_only\n",
            this->scan_stamp, (int)W.valid, W.ncorr,
            W.lambda(0), W.lambda(1), W.lambda(2),
            W.ratio(0), W.ratio(1), W.ratio(2),
@@ -1750,10 +1764,16 @@ void dlio::OdomNode::logDegeneracy() {
            (double)this->imu_rx_maxdt_, (long)this->imu_rx_gaps_,
            (int)this->submap_size_, (int)this->submap_kcc_added_,
            (long)this->submap_short_refused_,
+           (double)this->submap_dmax_, (double)this->submap_dkcc_,
            (double)this->keyframe_age_last_s_, (long)this->keyframe_age_fired_,
            this->keyframe_age_.max_age_s, this->keyframe_age_travel_m_,
            (double)this->geo_abias_clamp_[0], (double)this->geo_abias_clamp_[1],
            (double)this->geo_abias_clamp_[2], this->geo_abias_margin_,
+           (int)this->degen_rot_.valid,
+           this->degen_rot_.lambda(0), this->degen_rot_.lambda(1),
+           this->degen_rot_.lambda(2), this->degen_rot_.ratio_min(),
+           this->degen_rot_.u_min(0), this->degen_rot_.u_min(1),
+           this->degen_rot_.u_min(2), this->degen_rot_.cond6,
            // WHAT THIS RUN STARTED FROM, on every line that carries a verdict.
            // Held under the same print_mutex_ this block already owns, which is
            // also the lock callbackImu takes to write it.
@@ -2631,6 +2651,14 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
   const std::size_t before_kcc = this->submap_kf_idx_curr.size();
   this->pushSubmapIndices(concave_ds, this->submap_kcc_, this->keyframe_concave, ds.size());
   this->submap_kcc_added_ = (int)(this->submap_kf_idx_curr.size() - before_kcc);
+  {   // the farthest keyframe THIS call let in -- the 68 m number, per scan
+    double dk = 0.;
+    for (std::size_t z = before_kcc; z < this->submap_kf_idx_curr.size(); ++z) {
+      const int i = this->submap_kf_idx_curr[z];
+      if (i >= 0 && i < (int)ds.size() && ds[i] > dk) { dk = ds[i]; }
+    }
+    this->submap_dkcc_ = dk;
+  }
 
   // sort current and previous submap kf list of indices
   std::sort(this->submap_kf_idx_curr.begin(), this->submap_kf_idx_curr.end());
@@ -2644,6 +2672,13 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
   // registration is actually aiming at. 28 keyframes on RUN 2 at bag t 357.5,
   // 24 on the A/A, four of each 68 m away.
   this->submap_size_ = (int)this->submap_kf_idx_curr.size();
+  {   // the farthest member of the submap actually built
+    double dm = 0.;
+    for (int i : this->submap_kf_idx_curr) {
+      if (i >= 0 && i < (int)ds.size() && ds[i] > dm) { dm = ds[i]; }
+    }
+    this->submap_dmax_ = dm;
+  }
 
   // SUBMAP.md section 6, fix (5): "plus a [SUBMAP][WARN] counting the refusals,
   // so the silent-no-op law binds in both directions". A run that never refuses
@@ -3032,19 +3067,20 @@ void dlio::OdomNode::debug() {
     char repbuf[192];
     if (this->keyframe_age_.on()) {
       snprintf(repbuf, sizeof(repbuf),
-               "Repair :: sm=%d kcc=%d ref=%ld age=%.0fs/%ldkf ab<=%.2f/%.2f/%.2f",
-               (int)this->submap_size_, (int)this->submap_kcc_added_,
+               "Repair :: sm=%d/%.0fm kcc=%d ref=%ld age=%.0fs/%ldkf rr=%.3f",
+               (int)this->submap_size_, (double)this->submap_dmax_,
+               (int)this->submap_kcc_added_,
                (long)this->submap_short_refused_, this->keyframe_age_.max_age_s,
                (long)this->keyframe_age_fired_,
-               (double)this->geo_abias_clamp_[0], (double)this->geo_abias_clamp_[1],
-               (double)this->geo_abias_clamp_[2]);
+               this->degen_rot_.valid ? this->degen_rot_.ratio_min() : -1.0);
     } else {
       snprintf(repbuf, sizeof(repbuf),
-               "Repair :: sm=%d kcc=%d ref=%ld age=off ab<=%.2f/%.2f/%.2f",
-               (int)this->submap_size_, (int)this->submap_kcc_added_,
+               "Repair :: sm=%d/%.0fm kcc=%d ref=%ld age=off rr=%.3f ab<=%.2f",
+               (int)this->submap_size_, (double)this->submap_dmax_,
+               (int)this->submap_kcc_added_,
                (long)this->submap_short_refused_,
-               (double)this->geo_abias_clamp_[0], (double)this->geo_abias_clamp_[1],
-               (double)this->geo_abias_clamp_[2]);
+               this->degen_rot_.valid ? this->degen_rot_.ratio_min() : -1.0,
+               (double)this->geo_abias_clamp_[0]);
     }
     repbuf[66] = '\0';   // same hard truncation as the line above
     std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)

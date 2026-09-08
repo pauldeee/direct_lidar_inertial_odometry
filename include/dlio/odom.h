@@ -372,6 +372,11 @@ private:
   std::atomic<long> submap_short_refused_;   // lists refused (cumulative)
   std::atomic<int>  submap_kcc_added_;       // keyframes admitted by kcc, THIS submap
   std::atomic<int>  submap_size_;            // keyframes in the submap, THIS submap
+  // The distances that say whether the 68 m keyframes are actually gone. dmax
+  // is the farthest member of the submap the run built; dkcc is the farthest
+  // one the CONCAVE-hull call admitted (0 when it admitted none).
+  std::atomic<double> submap_dmax_;
+  std::atomic<double> submap_dkcc_;
   bool submap_refuse_reported_;              // one-shot: the hull is always short
 
   // (1b) the keyframe AGE clause. OFF unless max_age_s > 0.
@@ -381,6 +386,13 @@ private:
   std::atomic<long> keyframe_age_stale_;     // scans whose closest kf was older than max_age_s
   std::atomic<double> keyframe_age_last_s_;  // age of the closest kf, last scan
   bool keyframe_age_noop_reported_;          // one-shot: armed, stale seen, never fired
+
+  // ROTATION-BLOCK INSTRUMENT (dlio/degeneracy.h rotation_record). Read-only:
+  // no action is derived from it anywhere. Every lambda/r/w published by this
+  // programme so far is TRANSLATION, while the divergence onset is a HEADING
+  // error -- this is the column that could see that, fitted on raw observe data
+  // before anyone proposes an action on it.
+  dlio::degeneracy::RotRecord degen_rot_;
 
   // (N57) the accel-bias clamp derived from THIS run's 3 s init calibration.
   double geo_abias_margin_;                  // 0 = off = the constant below
