@@ -15,6 +15,7 @@
 #include <Eigen/Eigenvalues>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace dlio {
 namespace degeneracy {
@@ -118,6 +119,68 @@ inline double smoothstep(double r, double lo, double hi) {
 // arithmetic, is the part that can be silently wrong, and here a test can pin it.
 inline Eigen::Matrix3d translation_information(const Eigen::Matrix<double, 6, 6>& H) {
   return H.block<3, 3>(3, 3);
+}
+
+// The ROTATION block of the same 6x6, and the record that goes with it.
+//
+// EVERY lambda/r/w/u this programme has published so far is TRANSLATION:
+// scoreDegeneracy() reads translation_information(H) and discards the rest of
+// the 6x6. But the big Sandland divergence ONSET is a HEADING error -- the pose
+// went 15 deg off while the free-running IMU was only 5.7 deg off, through an
+// 80 deg/s turn at a bend with a 6 m sight line (SUBMAP.md section 6,
+// ONSET_IMU.md verdict 2) -- and a translation-only instrument is structurally
+// blind to it.
+//
+// This is INSTRUMENTATION ONLY. Nothing acts on it: no weight is derived from
+// it, updateState() never sees it, and the guard's arithmetic is untouched. It
+// exists so the rotation column can be FITTED on raw observe data before anyone
+// proposes an action on it ([[fit_sigma_on_raw_only]]).
+//
+// UNITS WARNING, and it is why cond6 is reported with a units token. The
+// rotation block's entries are (information x length^2) and the translation
+// block's are (information); under PLANE regularization neither carries a
+// physical scale, and the two are NOT commensurable. `cond6` -- the condition
+// number of the whole 6x6 -- therefore mixes units and is a RELATIVE series
+// only: comparable across scans of one run and across runs at the same
+// parameters, never a physical conditioning.
+inline Eigen::Matrix3d rotation_information(const Eigen::Matrix<double, 6, 6>& H) {
+  return H.block<3, 3>(0, 0);
+}
+
+struct RotRecord {
+  bool valid = false;
+  Eigen::Vector3d lambda = Eigen::Vector3d::Ones();   // ascending
+  Eigen::Vector3d u_min  = Eigen::Vector3d::UnitZ();  // weak rotation axis
+  double cond6 = 1.0;                                 // full 6x6, MIXED UNITS
+
+  double ratio_min() const {
+    return (this->lambda(2) > 0.0) ? this->lambda(0) / this->lambda(2) : 1.0;
+  }
+};
+
+// Read the rotation block and the full 6x6 spectrum. `hessian_valid` is
+// LsqRegistration::hasFinalHessian(), for exactly the reason the translation
+// scorer refuses without it: an unconverged scan leaves the PREVIOUS scan's
+// Hessian in the member, and judging this scan on last scan's geometry is a
+// silent no-op.
+inline RotRecord rotation_record(const Eigen::Matrix<double, 6, 6>& H,
+                                 bool hessian_valid) {
+  RotRecord R;
+  if (!hessian_valid || !H.allFinite()) { return R; }
+
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(rotation_information(H));
+  if (es.info() != Eigen::Success) { return R; }
+  R.lambda = es.eigenvalues();                 // Eigen returns ascending
+  R.u_min = es.eigenvectors().col(0);
+  if (!(R.lambda(2) > 0.0)) { return R; }
+
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es6(H);
+  if (es6.info() == Eigen::Success) {
+    const double lo = es6.eigenvalues()(0), hi = es6.eigenvalues()(5);
+    R.cond6 = (lo > 0.0) ? hi / lo : std::numeric_limits<double>::infinity();
+  }
+  R.valid = true;
+  return R;
 }
 
 // Score the translation block of the GICP Hessian.
