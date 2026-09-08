@@ -70,6 +70,15 @@ namespace resume {
 
 //: A quaternion whose norm is further than this from 1 is not a rotation, it is
 //: a typo (or three of four fields that arrived and one that did not).
+//:
+//: THIS IS CHECKED ON THE NUMBERS THAT ARRIVED, NOT ON THE SEED. make_seed()
+//: normalises, so by the time verify() sees a Seed the norm is 1 by
+//: construction and asking it again answers nothing. A component that arrived
+//: as zero normalises into a perfectly valid rotation pointing somewhere else
+//: -- the parent's own seed with q.z dropped comes out 106.6 deg away -- so the
+//: input norm is RECORDED at construction (Seed::q_norm_in) and that is what is
+//: judged. Found by the adversarial review, 2026-09-08: the old check could not
+//: fire on the production path, and its test built the Seed by hand to reach it.
 static const double QUAT_NORM_TOL = 1e-3;
 
 //: How far an applied prior may sit from the requested one before the run is
@@ -85,6 +94,12 @@ struct Seed {
   Eigen::Quaternionf q = Eigen::Quaternionf(1.f, 0.f, 0.f, 0.f);  // WORLD<-BASELINK
   Eigen::Vector3f p = Eigen::Vector3f::Zero();                    // WORLD, m
   Eigen::Vector3f v_w = Eigen::Vector3f::Zero();                  // WORLD, m/s
+
+  //: The norm of the attitude AS IT ARRIVED, before make_seed() normalised it.
+  //: 1 when no attitude was seeded, so a seed without one is never complained
+  //: about. This is the only surviving evidence that four numbers reached the
+  //: node rather than three; normalisation destroys the rest.
+  float q_norm_in = 1.f;
 
   //: What was actually seeded, for the log. Never "resume" on its own: a run
   //: that seeded nothing but claimed to be resuming is the failure this whole
@@ -145,7 +160,10 @@ inline Seed make_seed(bool have_attitude, const Eigen::Quaternionf& q,
   s.have_attitude = have_attitude;
   s.have_position = have_position;
   s.have_velocity = have_velocity;
-  if (have_attitude) s.q = q.normalized();
+  if (have_attitude) {
+    s.q_norm_in = q.norm();          // BEFORE normalising: see QUAT_NORM_TOL
+    s.q = q.normalized();
+  }
   if (have_position) s.p = p;
   if (have_velocity) s.v_w = v_w;
   return s;
@@ -229,12 +247,20 @@ inline std::vector<Mismatch> verify(bool requested_calibration_off,
     }
   }
 
-  if (seed.have_attitude && !quaternion_is_sane(seed.q)) {
+  //: Judged on the arriving norm, not the normalised seed: see QUAT_NORM_TOL.
+  const bool q_arrived_sane =
+      std::isfinite((double)seed.q_norm_in) &&
+      std::fabs((double)seed.q_norm_in - 1.0) <= QUAT_NORM_TOL &&
+      quaternion_is_sane(seed.q);
+
+  if (seed.have_attitude && !q_arrived_sane) {
     Mismatch m;
     m.key = "dlio/resume/initial/attitude";
     m.requested = 1.;
-    m.effective = seed.q.norm();
-    m.note = "not a unit quaternion (w,x,y,z, WORLD<-BASELINK)";
+    m.effective = seed.q_norm_in;
+    m.note = "not a unit quaternion as it ARRIVED (w,x,y,z, WORLD<-BASELINK): "
+             "normalising it would produce a valid rotation pointing somewhere "
+             "the parent never was";
     out.push_back(m);
   }
 
@@ -242,7 +268,7 @@ inline std::vector<Mismatch> verify(bool requested_calibration_off,
   // no-op: four numbers arrived, none of them said anything. The parent's own
   // attitude at any pickup worth resuming from is never exactly identity --
   // gravity alignment alone puts roll/pitch a degree or two off.
-  if (seed.have_attitude && quaternion_is_sane(seed.q)) {
+  if (seed.have_attitude && q_arrived_sane) {
     const double off = std::fabs(1.0 - std::fabs((double)seed.q.w()));
     if (off < 1e-9) {
       Mismatch m;
