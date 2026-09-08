@@ -13,6 +13,7 @@
 #include "dlio/dlio.h"
 #include "dlio/degeneracy.h"
 #include "dlio/imu_delivery.h"
+#include "dlio/repairs.h"
 #include <ros/callback_queue.h>
 #include <ros/subscribe_options.h>
 #include <memory>
@@ -84,7 +85,13 @@ private:
   void updateKeyframes();
   void computeConvexHull();
   void computeConcaveHull();
-  void pushSubmapIndices(std::vector<float> dists, int k, std::vector<int> frames);
+  // `population` is the number of keyframes `dists` was computed over. It is
+  // what separates "the k nearest of a population smaller than k" (correct,
+  // and the only submap there is at run start) from "the whole of a hull
+  // shorter than k, at any distance" (the defect: four keyframes 68 m away
+  // in every submap on ad3517ba). See dlio/repairs.h.
+  void pushSubmapIndices(std::vector<float> dists, int k, std::vector<int> frames,
+                         std::size_t population);
   void buildSubmap(State vehicle_state);
   void buildKeyframesAndSubmap(State vehicle_state);
   void pauseSubmapBuildIfNeeded();
@@ -354,6 +361,29 @@ private:
   int submap_kcv_;
   int submap_kcc_;
   double submap_concave_alpha_;
+
+  // --- INCREMENT 1 repairs (slamlab) -----------------------------------------
+  // (1a) the short-candidate-list refusal. `smkcc` is how many keyframes the
+  // CONCAVE-hull call admitted on the scan just built -- the number that must go
+  // to zero on this bag -- and `refused` counts every list the guard turned away
+  // over the run, so the repair cannot be a silent no-op in either direction.
+  std::atomic<long> submap_short_refused_;   // lists refused (cumulative)
+  std::atomic<int>  submap_kcc_added_;       // keyframes admitted by kcc, THIS submap
+  std::atomic<int>  submap_size_;            // keyframes in the submap, THIS submap
+  bool submap_refuse_reported_;              // one-shot: the hull is always short
+
+  // (1b) the keyframe AGE clause. OFF unless max_age_s > 0.
+  dlio::repairs::KeyframeAge keyframe_age_;
+  double keyframe_age_travel_m_;             // resolved 0.25*threshD unless set
+  std::atomic<long> keyframe_age_fired_;     // keyframes laid BY the age clause
+  std::atomic<long> keyframe_age_stale_;     // scans whose closest kf was older than max_age_s
+  std::atomic<double> keyframe_age_last_s_;  // age of the closest kf, last scan
+  bool keyframe_age_noop_reported_;          // one-shot: armed, stale seen, never fired
+
+  // (N57) the accel-bias clamp derived from THIS run's 3 s init calibration.
+  double geo_abias_margin_;                  // 0 = off = the constant below
+  Eigen::Vector3f geo_abias_clamp_;          // what updateState() actually uses
+  bool geo_abias_derived_;                   // true once the calibration landed
 
   bool densemap_filtered_;
   // When true (default), the PUBLISHED/saved deskewed cloud is the full-density

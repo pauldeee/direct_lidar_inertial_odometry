@@ -149,6 +149,20 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
   this->degen_noop_reported_ = false;
   this->degen_blind_reported_ = false;
 
+  // INCREMENT 1 repairs (dlio/repairs.h). Every counter starts at zero and the
+  // clamp starts at the CONFIGURED constant, so a run that arms nothing is the
+  // stock run with three more numbers printed.
+  this->submap_short_refused_ = 0;
+  this->submap_kcc_added_ = 0;
+  this->submap_size_ = 0;
+  this->submap_refuse_reported_ = false;
+  this->keyframe_age_fired_ = 0;
+  this->keyframe_age_stale_ = 0;
+  this->keyframe_age_last_s_ = 0.;
+  this->keyframe_age_noop_reported_ = false;
+  this->geo_abias_derived_ = false;
+  this->geo_abias_clamp_.setConstant((float)this->geo_abias_max_);
+
   this->convex_hull.setDimension(3);
   this->concave_hull.setDimension(3);
   this->concave_hull.setAlpha(this->keyframe_thresh_dist_);
@@ -275,6 +289,21 @@ void dlio::OdomNode::getParams() {
   ros::param::param<int>("~dlio/odom/submap/keyframe/knn", this->submap_knn_, 10);
   ros::param::param<int>("~dlio/odom/submap/keyframe/kcv", this->submap_kcv_, 10);
   ros::param::param<int>("~dlio/odom/submap/keyframe/kcc", this->submap_kcc_, 10);
+
+  // INCREMENT 1b -- THE KEYFRAME AGE CLAUSE. DEFAULT 0 = OFF, so a row that
+  // sets neither key produces a byte-identical parameter dump and a
+  // byte-identical keyframe decision to stock DLIO. See dlio/repairs.h and
+  // keeper/sandland_2860/big_bag/submap_check/SUBMAP.md section 5: on a revisit
+  // the closest keyframe of ANY age is 0.18-0.81 m away and 139-158 s old, the
+  // rotation escape hatch is closed by num_nearby >= 3, and the run makes NO
+  // keyframe for 28.80 s while believing it walked 15.77 m and turned 162 deg.
+  ros::param::param<double>("~dlio/odom/keyframe/max_age_s",
+                            this->keyframe_age_.max_age_s, 0.0);
+  // Negative = derive 0.25 * threshD. Read AFTER threshD on purpose.
+  ros::param::param<double>("~dlio/odom/keyframe/min_travel_m",
+                            this->keyframe_age_.min_travel_m, -1.0);
+  this->keyframe_age_travel_m_ =
+      this->keyframe_age_.travel_floor(this->keyframe_thresh_dist_);
 
   // Dense map resolution
   ros::param::param<bool>("~dlio/map/dense/filtered", this->densemap_filtered_, true);
@@ -403,6 +432,24 @@ void dlio::OdomNode::getParams() {
   ros::param::param<double>("~dlio/odom/geo/Kab", this->geo_Kab_, 1.0);
   ros::param::param<double>("~dlio/odom/geo/Kgb", this->geo_Kgb_, 1.0);
   ros::param::param<double>("~dlio/odom/geo/abias_max", this->geo_abias_max_, 1.0);
+  // N57 -- THE CLAMP MUST NOT BE AN ABSOLUTE CONSTANT. 0.3 is BELOW this rig's
+  // own turn-on bias (Octagon init 0.305; big bag 0.236-0.251), so it clips the
+  // CALIBRATED value. With a positive margin the bound becomes |b_init| + margin
+  // PER AXIS, measured by this run's own 3 s init calibration. 0 = off = the
+  // constant above, unchanged, which is what every existing row gets.
+  ros::param::param<double>("~dlio/odom/geo/abias_margin", this->geo_abias_margin_, 0.0);
+  // The derivation has exactly one source. If accel calibration is off there is
+  // no |b_init| to derive from and the margin would silently do nothing.
+  if (this->geo_abias_margin_ > 0.0 && !this->calibrate_accel_) {
+    fprintf(stderr,
+            "[REPAIR][ERROR] dlio/odom/geo/abias_margin=%.4f asks for a clamp "
+            "derived from the init calibration, but dlio/odom/imu/calibration/"
+            "accel is FALSE, so no bias is ever measured. The clamp would stay "
+            "at the constant abias_max=%.4f and the margin would be a silent "
+            "no-op. Set one or the other.\n",
+            this->geo_abias_margin_, this->geo_abias_max_);
+    fflush(stderr);
+  }
   ros::param::param<double>("~dlio/odom/geo/gbias_max", this->geo_gbias_max_, 1.0);
 
   // GICP degeneracy guard. EVERY default here reproduces stock DLIO: with
@@ -1271,6 +1318,25 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::Imu::ConstPtr& imu_raw) {
                                              << to_string_with_precision(this->state.b.gyro[2], 8) << std::endl;
       }
 
+      // N57 -- THE CLAMP, FROM THIS RUN'S OWN CALIBRATION. Derived here and
+      // nowhere else, exactly once, from the value the lines above just
+      // measured; with abias_margin = 0 (the default) this returns the
+      // configured constant on all three axes and updateState()'s arithmetic
+      // is bit-for-bit what it always was. See dlio/repairs.h.
+      this->geo_abias_clamp_ = dlio::repairs::derive_abias_clamp(
+          this->state.b.accel, this->geo_abias_margin_, this->geo_abias_max_);
+      this->geo_abias_derived_ = true;
+      if (this->geo_abias_margin_ > 0.0) {
+        std::lock_guard<std::mutex> print_lock(this->print_mutex_);
+        printf("[REPAIR] abias clamp DERIVED from this run's %.1f s init "
+               "calibration: |b_init| + margin %.4f -> (%.4f, %.4f, %.4f) "
+               "units=m/s^2 (the configured constant %.4f is NOT used)\n",
+               this->imu_calib_time_, this->geo_abias_margin_,
+               (double)this->geo_abias_clamp_[0], (double)this->geo_abias_clamp_[1],
+               (double)this->geo_abias_clamp_[2], this->geo_abias_max_);
+        fflush(stdout);
+      }
+
       this->imu_calibrated = true;
 
     }
@@ -1443,7 +1509,12 @@ void dlio::OdomNode::logDegeneracy() {
            "tau=%.4f/%.4f wfloor=%.3f mode=%s "
            "n=%ld deg=%ld app=%ld inv=%ld "
            "q_min=%.6g info=%.4f/%.4f innov=%.4f dp=%.4f "
-           "imu_rx=%ld imu_hz=%.3f imu_dtmax=%.4f imu_gaps=%ld\n",
+           "imu_rx=%ld imu_hz=%.3f imu_dtmax=%.4f imu_gaps=%ld "
+           "smsz=%d smkcc=%d smref=%ld kfage=%.2f kfn=%ld kfmax=%.2f kfmin=%.3f "
+           "abmax=%.4f,%.4f,%.4f abmrg=%.4f "
+           "units=lam:corr_count;q:corr_count_per_corr;rm:m;innov:m;dp:m;"
+           "imu_hz:Hz;imu_dtmax:s;smsz:keyframes;smkcc:indices;smref:lists;"
+           "kfage:s;kfn:keyframes;kfmax:s;kfmin:m;abmax:m_per_s2;abmrg:m_per_s2\n",
            this->scan_stamp, (int)W.valid, W.ncorr,
            W.lambda(0), W.lambda(1), W.lambda(2),
            W.ratio(0), W.ratio(1), W.ratio(2),
@@ -1459,7 +1530,13 @@ void dlio::OdomNode::logDegeneracy() {
            this->degen_params_.min_info, this->degen_params_.full_info,
            (double)this->degen_innov_, (double)this->degen_dp_,
            (long)this->imu_rx_n_, (double)this->imu_rx_hz_,
-           (double)this->imu_rx_maxdt_, (long)this->imu_rx_gaps_);
+           (double)this->imu_rx_maxdt_, (long)this->imu_rx_gaps_,
+           (int)this->submap_size_, (int)this->submap_kcc_added_,
+           (long)this->submap_short_refused_,
+           (double)this->keyframe_age_last_s_, (long)this->keyframe_age_fired_,
+           this->keyframe_age_.max_age_s, this->keyframe_age_travel_m_,
+           (double)this->geo_abias_clamp_[0], (double)this->geo_abias_clamp_[1],
+           (double)this->geo_abias_clamp_[2], this->geo_abias_margin_);
     fflush(stdout);
   }
 
@@ -1860,12 +1937,15 @@ void dlio::OdomNode::updateState() {
 
   err_body = qhat.conjugate()._transformVector(err);
 
-  double abias_max = this->geo_abias_max_;
+  // N57: the bound is PER AXIS and comes from dlio/repairs.h. With
+  // abias_margin = 0 all three entries equal the configured abias_max and this
+  // is the scalar clamp DLIO has always applied, to the bit.
+  const Eigen::Vector3f abias_max = this->geo_abias_clamp_;
   double gbias_max = this->geo_gbias_max_;
 
   // Update accel bias
   this->state.b.accel -= dt * this->geo_Kab_ * err_body;
-  this->state.b.accel = this->state.b.accel.array().min(abias_max).max(-abias_max);
+  this->state.b.accel = this->state.b.accel.array().min(abias_max.array()).max(-abias_max.array());
 
   // Update gyro bias
   this->state.b.gyro[0] -= dt * this->geo_Kgb_ * qe.w() * qe.x();
@@ -2092,6 +2172,29 @@ void dlio::OdomNode::updateKeyframes() {
 
   }
 
+  // INCREMENT 1b -- how OLD is that closest keyframe, and how far have I come
+  // since I last laid one? Stock DLIO computes neither. `closest_idx` indexes
+  // keyframes and keyframe_timestamps in lockstep (both are push_back'd together
+  // under keyframes_mutex below), so the age is a lookup, not a search.
+  double closest_age_s = 0.;
+  if (closest_idx < (int)this->keyframe_timestamps.size()) {
+    // Both sides are HEADER stamps. scan_stamp is the MEDIAN point time and
+    // would introduce a systematic <= 50 ms offset against a stored header
+    // stamp; on a 15 s threshold that is noise, but a replay harness comparing
+    // this against exported poses should not have to know about it.
+    closest_age_s = this->scan_header_stamp.toSec()
+                  - this->keyframe_timestamps[closest_idx].toSec();
+  }
+  this->keyframe_age_last_s_ = closest_age_s;
+  // Distance from MY OWN LAST keyframe, which on a revisit is a completely
+  // different number from the distance to the closest keyframe of any age --
+  // that difference IS the defect.
+  double travel_since_last_kf = 0.;
+  if (!this->keyframes.empty()) {
+    const Eigen::Vector3f& lastp = this->keyframes.back().first.first;
+    travel_since_last_kf = (this->state.p - lastp).norm();
+  }
+
   // get closest pose and corresponding rotation
   Eigen::Vector3f closest_pose = this->keyframes[closest_idx].first.first;
   Eigen::Quaternionf closest_pose_r = this->keyframes[closest_idx].first.second;
@@ -2128,6 +2231,44 @@ void dlio::OdomNode::updateKeyframes() {
 
   if (abs(dd) <= this->keyframe_thresh_dist_ && abs(theta_deg) > this->keyframe_thresh_rot_ && num_nearby <= 1) {
     newKeyframe = true;
+  }
+
+  // INCREMENT 1b -- THE AGE CLAUSE. Appended AFTER the three stock clauses and
+  // never able to unset them, so with max_age_s = 0 (the default) this block is
+  // dead and the decision above is stock DLIO's, unchanged.
+  //
+  // "The closest keyframe is older than max_age_s AND I have moved at least
+  // min_travel_m since I laid my own last one." The second half is what keeps a
+  // stationary rig from laying keyframes forever (this rig's bags carry 151
+  // pauses); the first is what tells "I have been here" from "I have just been
+  // here", which is the one question DLIO's Euclidean test cannot answer.
+  if (this->keyframe_age_.on() && closest_age_s > this->keyframe_age_.max_age_s) {
+    ++this->keyframe_age_stale_;
+  }
+  if (!newKeyframe &&
+      dlio::repairs::age_clause(closest_age_s, travel_since_last_kf,
+                                this->keyframe_age_, this->keyframe_age_travel_m_)) {
+    newKeyframe = true;
+    ++this->keyframe_age_fired_;
+  }
+
+  // SILENT NO-OP LAW. COMPUTED > 0 and APPLIED == 0 is a hard complaint: the
+  // clause is armed, it has seen 500 scans whose closest keyframe was over the
+  // age, and it has still never laid one -- which means min_travel_m is holding
+  // it shut (a stationary rig, or a floor set larger than the drift), not that
+  // the scene never went stale. 500 scans = 50 s of a 10 Hz sensor.
+  if (this->keyframe_age_.on() && !this->keyframe_age_noop_reported_ &&
+      this->keyframe_age_stale_ > 500 && this->keyframe_age_fired_ == 0) {
+    this->keyframe_age_noop_reported_ = true;
+    fprintf(stderr,
+            "[REPAIR][ERROR] keyframe age clause armed (max_age_s=%.2f, "
+            "min_travel_m=%.3f) and %ld scans saw a closest keyframe older than "
+            "that, but NOT ONE keyframe was laid by it. The travel floor is "
+            "refusing every one of them -- check dlio/odom/keyframe/min_travel_m "
+            "against how far this rig actually moves between scans.\n",
+            this->keyframe_age_.max_age_s, this->keyframe_age_travel_m_,
+            (long)this->keyframe_age_stale_);
+    fflush(stderr);
   }
 
   if (newKeyframe) {
@@ -2170,10 +2311,30 @@ void dlio::OdomNode::setAdaptiveParams() {
 
 }
 
-void dlio::OdomNode::pushSubmapIndices(std::vector<float> dists, int k, std::vector<int> frames) {
+void dlio::OdomNode::pushSubmapIndices(std::vector<float> dists, int k, std::vector<int> frames,
+                                       std::size_t population) {
 
   // make sure dists is not empty
   if (!dists.size()) { return; }
+
+  // INCREMENT 1a -- THE UNBOUNDED CANDIDATE LIST.
+  //
+  // Below, the max-heap holds at most k elements and `kth_element` is its top.
+  // With fewer than k candidates that top is the LARGEST distance in the list,
+  // so the inclusive test admits EVERY candidate, at ANY distance. For the knn
+  // call that is right (the list is the whole keyframe population, and "the 20
+  // nearest of the 3 that exist" is all 3). For the two HULL calls it is not:
+  // the list is a filtered subset, there are nearer keyframes outside it, and
+  // on ad3517ba the concave hull returns 4-8 vertices against kcc = 10 -- which
+  // is how keyframes 0-3, sitting 68 m away in the opening chamber outside the
+  // mapped corridor, are in every submap this bag builds.
+  //
+  // dlio/repairs.h carries the reasoning and the alternative (deriving the
+  // hull's alpha) and why it was not taken.
+  if (dlio::repairs::refuse_short_candidate_list(dists.size(), k, population)) {
+    ++this->submap_short_refused_;
+    return;
+  }
 
   // maintain max heap of at most k elements
   std::priority_queue<float> pq;
@@ -2217,7 +2378,9 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
   lock.unlock();
 
   // get indices for top K nearest neighbor keyframe poses
-  this->pushSubmapIndices(ds, this->submap_knn_, keyframe_nn);
+  // population == ds.size(): this list IS the whole keyframe population, so a
+  // short list here is not the defect and stock behaviour is kept verbatim.
+  this->pushSubmapIndices(ds, this->submap_knn_, keyframe_nn, ds.size());
 
   // get convex hull indices
   this->computeConvexHull();
@@ -2229,7 +2392,7 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
   }
 
   // get indices for top kNN for convex hull
-  this->pushSubmapIndices(convex_ds, this->submap_kcv_, this->keyframe_convex);
+  this->pushSubmapIndices(convex_ds, this->submap_kcv_, this->keyframe_convex, ds.size());
 
   // get concave hull indices
   this->computeConcaveHull();
@@ -2240,8 +2403,13 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
     concave_ds.push_back(ds[c]);
   }
 
-  // get indices for top kNN for concave hull
-  this->pushSubmapIndices(concave_ds, this->submap_kcc_, this->keyframe_concave);
+  // get indices for top kNN for concave hull. `smkcc` on the [DEGEN] line is the
+  // number of index entries THIS call pushed (before the union is de-duplicated):
+  // the number the repair must drive to zero on a bag whose alpha-complex is
+  // empty at alpha = threshD.
+  const std::size_t before_kcc = this->submap_kf_idx_curr.size();
+  this->pushSubmapIndices(concave_ds, this->submap_kcc_, this->keyframe_concave, ds.size());
+  this->submap_kcc_added_ = (int)(this->submap_kf_idx_curr.size() - before_kcc);
 
   // sort current and previous submap kf list of indices
   std::sort(this->submap_kf_idx_curr.begin(), this->submap_kf_idx_curr.end());
@@ -2250,6 +2418,31 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
   // remove duplicate indices
   auto last = std::unique(this->submap_kf_idx_curr.begin(), this->submap_kf_idx_curr.end());
   this->submap_kf_idx_curr.erase(last, this->submap_kf_idx_curr.end());
+
+  // Submap COMPOSITION SIZE, after the union and the de-duplication: what the
+  // registration is actually aiming at. 28 keyframes on RUN 2 at bag t 357.5,
+  // 24 on the A/A, four of each 68 m away.
+  this->submap_size_ = (int)this->submap_kf_idx_curr.size();
+
+  // SUBMAP.md section 6, fix (5): "plus a [SUBMAP][WARN] counting the refusals,
+  // so the silent-no-op law binds in both directions". A run that never refuses
+  // is a run whose hulls were always at least k long and the repair changed
+  // nothing; a run that refuses on essentially every scan is telling you the
+  // alpha-complex is empty and the kcc term has never done anything. Both are
+  // findings; neither may be silent.
+  if (!this->submap_refuse_reported_ && this->submap_short_refused_ > 1000) {
+    this->submap_refuse_reported_ = true;
+    fprintf(stderr,
+            "[SUBMAP][WARN] %ld hull candidate lists shorter than k have been "
+            "REFUSED (kcv=%d, kcc=%d). Stock DLIO would have admitted each whole "
+            "list at unbounded distance. With alpha = threshD = %.3f m the "
+            "concave hull's alpha-complex is empty on this scene, so the kcc "
+            "term contributes nothing -- which is the true state of it, not a "
+            "regression.\n",
+            (long)this->submap_short_refused_, this->submap_kcv_, this->submap_kcc_,
+            this->keyframe_thresh_dist_);
+    fflush(stderr);
+  }
 
   // check if submap has changed from previous iteration
   if (this->submap_kf_idx_curr != this->submap_kf_idx_prev){
@@ -2572,6 +2765,37 @@ void dlio::OdomNode::debug() {
     degbuf[66] = '\0';   // buffer is 160, so this only ever SHORTENS
     std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
       << degbuf << "|" << std::endl;
+  }
+
+  // INCREMENT 1 REPAIR RECORD. Always printed, so the line also identifies
+  // which image is running and what it was armed with -- the three numbers a
+  // reader needs to tell 1a from 1b from stock without opening the yaml.
+  //   sm   submap composition size, keyframes, after the union
+  //   kcc  index entries the CONCAVE-hull call pushed on that submap
+  //   ref  candidate lists refused for being shorter than k (cumulative)
+  //   age  max_age_s / keyframes laid by the age clause (cumulative)
+  //   ab   the per-axis accel-bias clamp actually in force, m/s^2
+  {
+    char repbuf[192];
+    if (this->keyframe_age_.on()) {
+      snprintf(repbuf, sizeof(repbuf),
+               "Repair :: sm=%d kcc=%d ref=%ld age=%.0fs/%ldkf ab<=%.2f/%.2f/%.2f",
+               (int)this->submap_size_, (int)this->submap_kcc_added_,
+               (long)this->submap_short_refused_, this->keyframe_age_.max_age_s,
+               (long)this->keyframe_age_fired_,
+               (double)this->geo_abias_clamp_[0], (double)this->geo_abias_clamp_[1],
+               (double)this->geo_abias_clamp_[2]);
+    } else {
+      snprintf(repbuf, sizeof(repbuf),
+               "Repair :: sm=%d kcc=%d ref=%ld age=off ab<=%.2f/%.2f/%.2f",
+               (int)this->submap_size_, (int)this->submap_kcc_added_,
+               (long)this->submap_short_refused_,
+               (double)this->geo_abias_clamp_[0], (double)this->geo_abias_clamp_[1],
+               (double)this->geo_abias_clamp_[2]);
+    }
+    repbuf[66] = '\0';   // same hard truncation as the line above
+    std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
+      << repbuf << "|" << std::endl;
   }
   std::cout << "|                                                                   |" << std::endl;
 
