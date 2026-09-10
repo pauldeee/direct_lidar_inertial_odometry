@@ -163,7 +163,18 @@ int main(int argc, char** argv) {
   // "h6b" (the SHIPPING route: Lambda = s * H6b + floor, built in C++) or
   // "tape" (a Lambda built in python -- E0's bracket, which exists nowhere in
   // the live path and must not).
+  if (strs.count("linear_solver")) P.linear_solver = strs["linear_solver"];
   const std::string info_src = strs.count("info_source") ? strs["info_source"] : "h6b";
+  if (info_src != "tape" && info_src != "h6b") {
+    // A value nobody recognises must STOP, not fall through to the other
+    // source: a quoted 'tape' once fell through to h6b, every registration
+    // factor got ZERO information, and the replay produced a pure inertial
+    // dead-reckoning that looked like a trajectory.
+    std::fprintf(stderr,
+                 "[REPLAY][ERROR] info_source=%s is not 'h6b' or 'tape'\n",
+                 info_src.c_str());
+    return 5;
+  }
   if (info_src == "tape" && !tape.has_lambda) {
     std::fprintf(stderr, "[REPLAY][ERROR] info_source=tape but the tape carries "
                          "no Lambda\n");
@@ -321,10 +332,11 @@ int main(int argc, char** argv) {
   const std::string v = ledger.violation(P.alpha);
   std::fprintf(stderr,
                "[REPLAY] %s | scans %ld solved %ld computed %ld applied %ld "
-               "exceptions %ld | reg_factors %ld floor_binding %ld psd_proj %ld "
+               "exceptions %ld reseats %ld | reg_factors %ld floor_binding %ld psd_proj %ld "
                "imu_gaps %ld | solve_ms p50 %.3f p95 %.3f max %.3f mean %.3f | %s\n",
                sm.versionString().c_str(), ledger.scans, ledger.solved,
-               ledger.computed, ledger.applied, ledger.exceptions, n_reg, n_floor,
+               ledger.computed, ledger.applied, ledger.exceptions, ledger.reseats,
+               n_reg, n_floor,
                n_psd, n_gap, pct(0.50), pct(0.95), solve_ms_max,
                solve_ms_sum / std::max<std::size_t>(1, solve_ms.size()),
                v.empty() ? "OK" : ("SILENT-NO-OP: " + v).c_str());

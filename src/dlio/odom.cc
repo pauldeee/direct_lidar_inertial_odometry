@@ -361,14 +361,15 @@ dlio::OdomNode::~OdomNode() {
     const std::string viol =
         this->smoother_ledger_.violation(this->smoother_params_.alpha);
     printf("[SMOOTH] SUMMARY scans=%ld solved=%ld computed=%ld applied=%ld "
-           "exceptions=%ld kf_applied=%ld kf_refused=%ld raw_imu=%ld "
+           "exceptions=%ld reseats=%ld kf_applied=%ld kf_refused=%ld raw_imu=%ld "
            "solve_ms p50=%.3f p95=%.3f p99=%.3f max=%.3f mean=%.3f "
            "budget_100ms_exceeded=%ld verdict=%s "
            "units=solve_ms:ms;budget:scans_whose_solve_exceeded_the_100_ms_"
            "scan_period\n",
            this->smoother_ledger_.scans, this->smoother_ledger_.solved,
            this->smoother_ledger_.computed, this->smoother_ledger_.applied,
-           this->smoother_ledger_.exceptions, (long)this->smoother_kf_applied_,
+           this->smoother_ledger_.exceptions, this->smoother_ledger_.reseats,
+           (long)this->smoother_kf_applied_,
            (long)this->smoother_kf_refused_, (long)this->raw_imu_n_,
            q(0.50), q(0.95), q(0.99), v.back(), sum / (double)v.size(),
            (long)std::count_if(v.begin(), v.end(),
@@ -547,6 +548,8 @@ void dlio::OdomNode::getParams() {
                               S.lm_max_iterations, 20);
     ros::param::param<double>("~dlio/smoother/lm_relative_error_tol",
                               S.lm_relative_error_tol, 1e-8);
+    ros::param::param<std::string>("~dlio/smoother/linear_solver",
+                                   S.linear_solver, std::string("MULTIFRONTAL_CHOLESKY"));
     // A sample interval longer than this is DECLARED and counted rather than
     // hidden. 3 ticks at 640 Hz = 4.7 ms.
     ros::param::param<double>("~dlio/smoother/imu_gap_s", S.imu_gap_s,
@@ -2346,7 +2349,7 @@ void dlio::OdomNode::logSmoother() {
            "groups=%d kfw=%d kffz=%d "
            "mcov=%.6g,%.6g,%.6g,%.6g,%.6g,%.6g "
            "r_imu=%.6g r_reg=%.6g regf=%d hvalid=%d ncorr=%d "
-           "imu_n=%d imu_gaps=%d floor=%d psd=%d exc=%d "
+           "imu_n=%d imu_gaps=%d floor=%d psd=%d exc=%d reseats=%ld "
            "s_rot=%.9g s_trans=%.9g "
            "n=%ld computed=%ld applied=%ld kf_applied=%ld kf_refused=%ld "
            "units=solve_ms:ms;corr_m:m;corr_deg:deg;app_m:m;app_deg:deg;"
@@ -2358,6 +2361,8 @@ void dlio::OdomNode::logSmoother() {
            "groups:WRITE_GROUPS_of_6_T_lidarPose_state_geoprev_bias_keyframes;"
            "kfw:in_window_keyframes_moved_THIS_scan;"
            "kffz:keyframes_that_LEFT_the_window_THIS_scan;"
+           "reseats:fixed_lag_windows_REBUILT_after_a_failed_update_"
+           "cumulative_a_run_with_any_is_not_a_clean_arm;"
            "alpha:BLEND_never_fitted_0_runs_and_writes_nothing\n",
            this->scan_stamp, (long)this->smoother_scans_ - 1, (int)S.valid,
            (int)S.solved_this_scan, S.solve_ms, S.window_vars, S.window_factors,
@@ -2369,6 +2374,7 @@ void dlio::OdomNode::logSmoother() {
            (int)this->degen_dp6_valid_, (int)this->degen_h_.valid,
            this->degen_h_.ncorr, S.imu_samples, S.imu_gaps,
            (int)S.floor_binding, (int)S.psd_projected, (int)S.update_exception,
+           (long)S.reseats,
            this->smoother_params_.info_scale_rot,
            this->smoother_params_.info_scale_trans,
            this->smoother_ledger_.scans, this->smoother_ledger_.computed,

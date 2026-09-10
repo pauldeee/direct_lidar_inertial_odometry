@@ -39,6 +39,7 @@
 #include <chrono>
 #include <cmath>
 #include <map>
+#include <cstdio>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -110,7 +111,7 @@ struct Smoother::Impl {
 
     lm.setMaxIterations(p.lm_max_iterations);
     lm.setRelativeErrorTol(p.lm_relative_error_tol);
-    lm.setLinearSolverType("MULTIFRONTAL_CHOLESKY");
+    lm.setLinearSolverType(p.linear_solver);
     sm.reset(new gtsam::BatchFixedLagSmoother(p.lag_s, lm));
   }
 
@@ -139,6 +140,19 @@ struct Smoother::Impl {
   // keyframe index -> the scan key its pose IS
   std::unordered_map<int, long> kf_key;
   long kf_frozen_upto = -1;      // keyframes with key <= this have left the window
+  bool exc_reported = false;
+  // A fixed-lag update that throws leaves the window in a state nobody can
+  // describe: the keys of that scan may or may not be in it, and every later
+  // CombinedImuFactor references the previous scan's keys. Left alone, ONE
+  // exception turns into a cascade -- the window stops marginalising, grows
+  // without bound and the solve time climbs, and NOTHING in the trajectory
+  // says so (measured: 309 throws in 2,600 scans took the window from 51 scans
+  // to 861). So a throw ARMS A RE-SEAT: the next scan starts a fresh chain,
+  // loudly, with a counter on the [SMOOTH] line.
+  bool needs_reseat = false;
+  long reseats = 0;
+  long singular_info = 0;
+  bool singular_reported = false;
 };
 
 Smoother::Smoother(const Params& p) : params_(p), impl_(new Impl(p)) {}
@@ -273,6 +287,48 @@ Solution Smoother::update(const ScanInput& in) {
     I.pending_t[KX(0)] = 0.0;
     I.pending_t[KV(0)] = 0.0;
     I.pending_t[KB(0)] = 0.0;
+  } else if (I.needs_reseat) {
+    // RE-SEAT. Bounded and reported, never silent. The key numbering continues
+    // so the keyframe map and the log stay readable; what restarts is the
+    // graph. Every keyframe the old window owned is frozen by construction --
+    // its key no longer exists anywhere -- and is reported as frozen so the map
+    // side can refuse any later delta for it.
+    const long k = ++I.k;
+    I.sm.reset(new gtsam::BatchFixedLagSmoother(P.lag_s, I.lm));
+    I.needs_reseat = false;
+    ++I.reseats;
+    for (const auto& kv : I.kf_key) out.kf_frozen.push_back(kv.first);
+    I.kf_key.clear();
+    Eigen::Matrix<double, 6, 1> gs;
+    gs << P.gauge_sigma_rp_deg * M_PI / 180.0, P.gauge_sigma_rp_deg * M_PI / 180.0,
+        P.gauge_sigma_yaw_deg * M_PI / 180.0, P.gauge_sigma_pos_m,
+        P.gauge_sigma_pos_m, P.gauge_sigma_pos_m;
+    Eigen::Matrix<double, 6, 1> bs;
+    bs << P.bias_prior_sigma_accel, P.bias_prior_sigma_accel,
+        P.bias_prior_sigma_accel, P.bias_prior_sigma_gyro,
+        P.bias_prior_sigma_gyro, P.bias_prior_sigma_gyro;
+    I.pending_f.addPrior(KX(k), Tg, gtsam::noiseModel::Diagonal::Sigmas(gs));
+    I.pending_f.addPrior(KV(k), gtsam::Vector3(v_init),
+                         gtsam::noiseModel::Isotropic::Sigma(3, P.v0_sigma));
+    I.pending_f.addPrior(KB(k), I.bias0, gtsam::noiseModel::Diagonal::Sigmas(bs));
+    I.pending_v.insert(KX(k), Tg);
+    I.pending_v.insert(KV(k), gtsam::Vector3(v_init));
+    I.pending_v.insert(KB(k), I.bias0);
+    const double tk = in.stamp - I.t0;
+    I.pending_t[KX(k)] = tk;
+    I.pending_t[KV(k)] = tk;
+    I.pending_t[KB(k)] = tk;
+    I.last_imu.reset();
+    I.last_reg.reset();
+    std::fprintf(stderr,
+                 "[SMOOTH][ERROR] RE-SEATING the fixed-lag window at scan k=%ld "
+                 "(t=%.4f) after a failed update -- re-seat #%ld. The window's "
+                 "accumulated information is GONE from here and the chain starts "
+                 "again at this scan's registration pose with the gauge prior. "
+                 "This is bounded and counted; a run with re-seats in it is not "
+                 "a clean arm.\n",
+                 (long)k, in.stamp, (long)I.reseats);
+    std::fflush(stderr);
   } else {
     const long k = ++I.k;
     I.last_imu.reset(new gtsam::CombinedImuFactor(KX(k - 1), KV(k - 1), KX(k),
@@ -288,14 +344,45 @@ Solution Smoother::update(const ScanInput& in) {
           P.floor_sigma_rot_deg, P.floor_sigma_trans_m, &proj, &bind);
       out.psd_projected = proj;
       out.floor_binding = bind;
+      // A SINGULAR information is not a weak factor, it is a broken one: it
+      // makes the linear system rank-deficient and the trajectory becomes pure
+      // inertial dead reckoning while every other column still looks healthy.
+      // The constant floor exists so this cannot happen; if it happens anyway
+      // the factor is REFUSED and COUNTED, never added.
+      Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> esL(Lam);
+      if (esL.info() != Eigen::Success || esL.eigenvalues()(0) <= 0.0) {
+        ++I.singular_info;
+        if (!I.singular_reported) {
+          I.singular_reported = true;
+          std::fprintf(stderr,
+                       "[SMOOTH][ERROR] the registration information is "
+                       "SINGULAR at scan k=%ld (lambda_min=%.6g). The factor is "
+                       "REFUSED, not added with zero weight. Check "
+                       "dlio/smoother/floor_sigma_* and info_scale_*: a floor "
+                       "of zero with an invalid Hessian is exactly this.\n",
+                       (long)k, esL.info() == Eigen::Success
+                                    ? esL.eigenvalues()(0) : 0.0);
+          std::fflush(stderr);
+        }
+        goto no_reg_factor;
+      }
+      {
       const gtsam::Pose3 meas(gtsam::Rot3(exp_so3(in.dp6.head<3>())),
                               gtsam::Point3(in.dp6.tail<3>()));
       auto base = gtsam::noiseModel::Gaussian::Information(Lam);
-      auto robust = gtsam::noiseModel::Robust::Create(
-          gtsam::noiseModel::mEstimator::Huber::Create(P.huber_k), base);
+      gtsam::SharedNoiseModel model = base;
+      // huber_k <= 0 removes the robust kernel entirely. It is NOT a shipping
+      // configuration -- the node refuses it -- and it exists so the offline
+      // harness can attribute a difference to the kernel rather than guess.
+      if (P.huber_k > 0.0) {
+        model = gtsam::noiseModel::Robust::Create(
+            gtsam::noiseModel::mEstimator::Huber::Create(P.huber_k), base);
+      }
       I.last_reg.reset(
-          new gtsam::BetweenFactor<gtsam::Pose3>(KX(k - 1), KX(k), meas, robust));
+          new gtsam::BetweenFactor<gtsam::Pose3>(KX(k - 1), KX(k), meas, model));
       I.pending_f.add(I.last_reg);
+      }
+      no_reg_factor:;
     }
 
     I.pending_v.insert(KX(k), Tg);
@@ -319,6 +406,18 @@ Solution Smoother::update(const ScanInput& in) {
       out.window_vars = (int)r.nonlinearVariables + (int)r.linearVariables;
     } catch (const std::exception& e) {
       out.update_exception = true;
+      I.needs_reseat = true;
+      // The FIRST one, NAMED. An estimator that throws once and then quietly
+      // stops marginalising looks like a working run with a growing window and
+      // a growing solve time, and nothing in the trajectory says so.
+      if (!I.exc_reported) {
+        I.exc_reported = true;
+        std::fprintf(stderr,
+                     "[SMOOTH][ERROR] the fixed-lag update THREW at scan k=%ld "
+                     "(t=%.4f): %s\n",
+                     (long)I.k, in.stamp, e.what());
+        std::fflush(stderr);
+      }
     }
     I.pending_f.resize(0);
     I.pending_v.clear();
@@ -419,6 +518,8 @@ Solution Smoother::update(const ScanInput& in) {
     }
   }
 
+  out.reseats = I.reseats;
+  out.singular_info = I.singular_info;
   out.window_factors = (int)I.sm->getFactors().size();
   if (out.window_vars == 0) out.window_vars = (int)I.sm->timestamps().size();
   out.solve_ms = std::chrono::duration<double, std::milli>(
