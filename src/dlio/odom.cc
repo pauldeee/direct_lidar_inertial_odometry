@@ -48,6 +48,79 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
   this->deskew_status = false;
   this->deskew_size = 0;
 
+  // --- E4 / ARCHITECT A -----------------------------------------------------
+  this->smoother_bias_seeded_ = false;
+  this->smoother_noop_reported_ = false;
+  this->smoother_scans_ = 0;
+  this->smoother_solve_ms_max_ = 0.;
+  this->smoother_kf_applied_ = 0;
+  this->smoother_kf_refused_ = 0;
+  this->smoother_submap_dirty_ = false;
+  this->raw_imu_n_ = 0;
+  this->raw_imu_keep_s_ = this->smoother_params_.lag_s + 5.0;
+  this->kf_sink_.reset(new dlio::OdomNode::KfSink(this));
+  if (this->smoother_params_.enabled) {
+    this->smoother_.reset(new dlio::smoother::Smoother(this->smoother_params_));
+    // The extrinsic comes from the GENERATED yaml, which getParams() has
+    // already read into extrinsics.baselink2imu -- never from the bundle
+    // sidecar, which still ships the house7 MicroStrain lever arm
+    // ([[rig2860_sidecar_imu_extrinsic_wrong]]).
+    this->smoother_->setExtrinsic(this->extrinsics.baselink2imu.R.cast<double>(),
+                                  this->extrinsics.baselink2imu.t.cast<double>());
+    printf("[SMOOTH] ARMED  %s  lag_s=%.2f alpha=%.3f "
+           "info_scale_rot=%.9g info_scale_trans=%.9g huber_k=%.3f "
+           "floor=(%.3g deg, %.3g m) marginalize_every=%d kf_writeback=%d\n",
+           this->smoother_->versionString().c_str(),
+           this->smoother_params_.lag_s, this->smoother_params_.alpha,
+           this->smoother_params_.info_scale_rot,
+           this->smoother_params_.info_scale_trans, this->smoother_params_.huber_k,
+           this->smoother_params_.floor_sigma_rot_deg,
+           this->smoother_params_.floor_sigma_trans_m,
+           this->smoother_params_.marginalize_every,
+           (int)this->smoother_params_.keyframe_writeback);
+    // The raw tap feeds gtsam the sample as it arrived; imu_accel_sm_ is DLIO's
+    // accelerometer scale-misalignment matrix and it is applied to the buffered
+    // copy only. Identity is the shipped value and the only one this tap is
+    // correct for, so a non-identity one must stop the run rather than be
+    // silently ignored.
+    if (!this->imu_accel_sm_.isIdentity(1e-9)) {
+      fprintf(stderr,
+              "[SMOOTH][ERROR] dlio/imu/intrinsics/accel/sm is not the identity "
+              "and the smoother's RAW IMU tap does not apply it. Either ship the "
+              "identity or teach the tap. Refusing to run with a silently "
+              "different IMU on the two sides.\n");
+      fflush(stderr);
+      ros::shutdown();
+    }
+    // Two actions on one scan are unattributable. The guard's ACTION is
+    // permanently off in this design (A_nudge sec 3.8): the eigen-summaries
+    // stay as telemetry, and the arbitration is the solve. `observe` is not
+    // only allowed but REQUIRED -- the smoother's information comes from the
+    // E2 record scoreDegeneracy() builds.
+    if (this->degen_params_.enabled) {
+      fprintf(stderr,
+              "[SMOOTH][ERROR] the degeneracy GUARD (dlio/odom/gicp/degeneracy/"
+              "enabled) and the smoother are both armed. Four hand-fitted bands "
+              "have failed in BOTH directions and the smoother exists to replace "
+              "them, not to run underneath one; two actions on one scan are "
+              "unattributable. Run the guard in OBSERVE mode.\n");
+      fflush(stderr);
+      ros::shutdown();
+    }
+    if (!this->degen_params_.scoring()) {
+      fprintf(stderr,
+              "[SMOOTH][ERROR] the smoother is armed but the degeneracy record "
+              "is OFF (neither enabled nor observe). The registration "
+              "information the smoother weighs -- H6b, dp6 -- is built in "
+              "scoreDegeneracy(), so with the record off every scan would reach "
+              "the graph carrying nothing but the constant floor. Set "
+              "dlio/odom/gicp/degeneracy/observe: true.\n");
+      fflush(stderr);
+      ros::shutdown();
+    }
+    fflush(stdout);
+  }
+
   // Lidar subscriber on a DEDICATED single-threaded callback queue (see odom.h):
   // a deep queue buffers the scan backlog while its lone spinner thread runs
   // callbackPointCloud strictly serially -> DLIO flushes every scan at its own
@@ -263,7 +336,38 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
 
 }
 
-dlio::OdomNode::~OdomNode() {}
+dlio::OdomNode::~OdomNode() {
+  // --- E4: the compute budget, reported rather than assumed. The design's own
+  // requirement is that the solve stays under the scan period (100 ms at 10 Hz)
+  // for a 5 s window; if it does not, the levers are marginalize_every and the
+  // lag, and this line is what says which.
+  if (this->smoother_ && !this->smoother_solve_ms_.empty()) {
+    std::vector<double> v = this->smoother_solve_ms_;
+    std::sort(v.begin(), v.end());
+    const auto q = [&v](double f) {
+      return v[(std::size_t)(f * (double)(v.size() - 1))];
+    };
+    double sum = 0.;
+    for (double x : v) sum += x;
+    const std::string viol =
+        this->smoother_ledger_.violation(this->smoother_params_.alpha);
+    printf("[SMOOTH] SUMMARY scans=%ld solved=%ld computed=%ld applied=%ld "
+           "exceptions=%ld kf_applied=%ld kf_refused=%ld raw_imu=%ld "
+           "solve_ms p50=%.3f p95=%.3f p99=%.3f max=%.3f mean=%.3f "
+           "budget_100ms_exceeded=%ld verdict=%s "
+           "units=solve_ms:ms;budget:scans_whose_solve_exceeded_the_100_ms_"
+           "scan_period\n",
+           this->smoother_ledger_.scans, this->smoother_ledger_.solved,
+           this->smoother_ledger_.computed, this->smoother_ledger_.applied,
+           this->smoother_ledger_.exceptions, (long)this->smoother_kf_applied_,
+           (long)this->smoother_kf_refused_, (long)this->raw_imu_n_,
+           q(0.50), q(0.95), q(0.99), v.back(), sum / (double)v.size(),
+           (long)std::count_if(v.begin(), v.end(),
+                               [](double x) { return x > 100.0; }),
+           viol.empty() ? "OK" : "SILENT-NO-OP");
+    fflush(stdout);
+  }
+}
 
 void dlio::OdomNode::getParams() {
 
@@ -400,6 +504,81 @@ void dlio::OdomNode::getParams() {
   // own report and that census are in the same unit and can be compared line
   // for line. It changes no arithmetic: it only sets when the counter says so.
   ros::param::param<double>("~dlio/odom/imu/gap_report_s", this->imu_gap_s_, 0.05);
+
+  // --- E4 / ARCHITECT A: the fixed-lag smoother ------------------------------
+  // ENABLED IS FALSE IN THE IMAGE. The recipe row turns it on, so the product
+  // path is untouched by the presence of this code, and a row that forgets the
+  // key gets stock DLIO rather than an unannounced estimator change.
+  // Every key below is proved APPLIED from the LIVE rosparam dump per draw
+  // (E4/IMPL/rosparam_proof.sh), never from the row (N58).
+  {
+    dlio::smoother::Params& S = this->smoother_params_;
+    ros::param::param<bool>  ("~dlio/smoother/enabled", S.enabled, false);
+    ros::param::param<double>("~dlio/smoother/lag_s", S.lag_s, 5.0);
+    ros::param::param<double>("~dlio/smoother/alpha", S.alpha, 0.5);
+    ros::param::param<double>("~dlio/smoother/info_scale_rot", S.info_scale_rot,
+                              0.031503901758232755);
+    ros::param::param<double>("~dlio/smoother/info_scale_trans", S.info_scale_trans,
+                              0.031503901758232755);
+    ros::param::param<double>("~dlio/smoother/huber_k", S.huber_k, 1.345);
+    ros::param::param<double>("~dlio/smoother/floor_sigma_trans_m",
+                              S.floor_sigma_trans_m, 10.0);
+    ros::param::param<double>("~dlio/smoother/floor_sigma_rot_deg",
+                              S.floor_sigma_rot_deg, 30.0);
+    ros::param::param<int>   ("~dlio/smoother/marginalize_every",
+                              S.marginalize_every, 1);
+    ros::param::param<int>   ("~dlio/smoother/marg_every", S.marg_every, 1);
+    ros::param::param<bool>  ("~dlio/smoother/keyframe_writeback",
+                              S.keyframe_writeback, true);
+    ros::param::param<double>("~dlio/smoother/kf_dirty_trans_m",
+                              S.kf_dirty_trans_m, 0.005);
+    ros::param::param<double>("~dlio/smoother/kf_dirty_rot_deg",
+                              S.kf_dirty_rot_deg, 0.05);
+    ros::param::param<int>   ("~dlio/smoother/lm_max_iterations",
+                              S.lm_max_iterations, 20);
+    ros::param::param<double>("~dlio/smoother/lm_relative_error_tol",
+                              S.lm_relative_error_tol, 1e-8);
+    // A sample interval longer than this is DECLARED and counted rather than
+    // hidden. 3 ticks at 640 Hz = 4.7 ms.
+    ros::param::param<double>("~dlio/smoother/imu_gap_s", S.imu_gap_s,
+                              3.0 / 640.0);
+    ros::param::param<int>   ("~dlio/smoother/log_every", S.log_every, 1);
+    ros::param::param<double>("~dlio/smoother/gauge_sigma_rp_deg",
+                              S.gauge_sigma_rp_deg, 0.5);
+    ros::param::param<double>("~dlio/smoother/gauge_sigma_yaw_deg",
+                              S.gauge_sigma_yaw_deg, 10.0);
+    ros::param::param<double>("~dlio/smoother/gauge_sigma_pos_m",
+                              S.gauge_sigma_pos_m, 10.0);
+    ros::param::param<double>("~dlio/smoother/v0_sigma", S.v0_sigma, 0.5);
+    ros::param::param<double>("~dlio/smoother/bias_prior_sigma_accel",
+                              S.bias_prior_sigma_accel, 0.05);
+    ros::param::param<double>("~dlio/smoother/bias_prior_sigma_gyro",
+                              S.bias_prior_sigma_gyro, 0.005);
+    // The rig's OWN measured Allan analysis, per axis, sensor frame. Exposed so
+    // a DIFFERENT rig can be given its own measurement -- never so this one can
+    // be tuned. reeval/check3_noise.json is the authority for rig 2860.
+    std::vector<double> vrw_d(S.vrw, S.vrw + 3), arw_d(S.arw, S.arw + 3);
+    std::vector<double> aad(S.acc_adev_2s, S.acc_adev_2s + 3);
+    std::vector<double> gad(S.gyr_adev_2s, S.gyr_adev_2s + 3);
+    std::vector<double> vrw_o, arw_o, aa_o, ga_o;
+    ros::param::param<std::vector<double>>("~dlio/smoother/imu/vrw", vrw_o, vrw_d);
+    ros::param::param<std::vector<double>>("~dlio/smoother/imu/arw", arw_o, arw_d);
+    ros::param::param<std::vector<double>>("~dlio/smoother/imu/acc_adev_2s", aa_o, aad);
+    ros::param::param<std::vector<double>>("~dlio/smoother/imu/gyr_adev_2s", ga_o, gad);
+    for (int i = 0; i < 3; ++i) {
+      if (vrw_o.size() == 3) S.vrw[i] = vrw_o[i];
+      if (arw_o.size() == 3) S.arw[i] = arw_o[i];
+      if (aa_o.size() == 3) S.acc_adev_2s[i] = aa_o[i];
+      if (ga_o.size() == 3) S.gyr_adev_2s[i] = ga_o[i];
+    }
+    S.gravity = this->gravity_;
+    if (S.alpha < 0.0 || S.alpha > 1.0) {
+      fprintf(stderr, "[SMOOTH][ERROR] alpha=%.4f is outside [0,1]. It is a "
+                      "BLEND, not a gain, and it is never fitted.\n", S.alpha);
+      fflush(stderr);
+      S.alpha = std::min(1.0, std::max(0.0, S.alpha));
+    }
+  }
 
   std::vector<float> accel_default{0., 0., 0.}; std::vector<float> prior_accel_bias;
   std::vector<float> gyro_default{0., 0., 0.}; std::vector<float> prior_gyro_bias;
@@ -1056,6 +1235,24 @@ void dlio::OdomNode::initializeInputTarget() {
   this->keyframe_normals.push_back(this->gicp.getSourceCovariances());
   this->keyframe_transformations.push_back(this->T_corr);
 
+    // --- E4: register the keyframe with the smoother. A keyframe IS a scan, so
+    // there is no new variable: the smoother records which of its own keys this
+    // keyframe's pose IS, and reads it back while that key is still inside the
+    // window. The parallel vectors below are the map side of the same fact.
+    {
+      std::lock_guard<std::mutex> lk(this->kf_delta_mutex_);
+      this->kf_pending_delta_.push_back(Eigen::Matrix4d::Identity());
+      this->kf_has_delta_.push_back(0);
+      Eigen::Matrix4d P0 = Eigen::Matrix4d::Identity();
+      P0.block<3, 3>(0, 0) = this->lidarPose.q.toRotationMatrix().cast<double>();
+      P0.block<3, 1>(0, 3) = this->lidarPose.p.cast<double>();
+      this->kf_pose_now_.push_back(P0);
+      this->kf_frozen_.push_back(0);
+    }
+    if (this->smoother_) {
+      this->smoother_->noteKeyframe((int)this->keyframes.size() - 1);
+    }
+
 }
 
 void dlio::OdomNode::setInputSource() {
@@ -1200,6 +1397,28 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::Imu::ConstPtr& imu_raw) {
 
   this->first_imu_received = true;
 
+  // --- E4: THE RAW TAP, three lines, BEFORE anything touches the sample -----
+  // The sample as it arrived, in the IMU's OWN frame, with no bias removed and
+  // no lever-arm term. gtsam's body_P_sensor does the frame change analytically
+  // and the CombinedImuFactor subtracts the bias it is currently estimating.
+  // DLIO's own imu_buffer is untouched by this and keeps its own arithmetic.
+  if (this->smoother_) {
+    dlio::OdomNode::RawImu r;
+    r.stamp = imu_raw->header.stamp.toSec();
+    r.accel << imu_raw->linear_acceleration.x, imu_raw->linear_acceleration.y,
+        imu_raw->linear_acceleration.z;
+    r.gyro << imu_raw->angular_velocity.x, imu_raw->angular_velocity.y,
+        imu_raw->angular_velocity.z;
+    std::lock_guard<std::mutex> lk(this->mtx_raw_imu_);
+    this->raw_imu_buffer_.push_back(r);
+    ++this->raw_imu_n_;
+    const double keep = r.stamp - this->raw_imu_keep_s_;
+    while (!this->raw_imu_buffer_.empty() &&
+           this->raw_imu_buffer_.front().stamp < keep) {
+      this->raw_imu_buffer_.pop_front();
+    }
+  }
+
   sensor_msgs::Imu::Ptr imu = this->transformImu( imu_raw );
   this->imu_stamp = imu->header.stamp;
 
@@ -1340,6 +1559,29 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::Imu::ConstPtr& imu_raw) {
       this->geo_abias_clamp_ = dlio::repairs::derive_abias_clamp(
           this->state.b.accel, this->geo_abias_margin_, this->geo_abias_max_);
       this->geo_abias_derived_ = true;
+
+      // --- E4: the smoother's bias prior is THIS RUN'S OWN 3 s init ---------
+      // state.b is in BASELINK (transformImu rotated the samples before the
+      // averages were taken); the CombinedImuFactor wants it in the SENSOR
+      // frame, because that is where it subtracts it from the raw sample. One
+      // conversion, in one place, with a fixture (test_smoother case 12).
+      if (this->smoother_) {
+        const Eigen::Vector3d ba = dlio::smoother::bias_sensor_from_bl(
+            this->extrinsics.baselink2imu.R, this->state.b.accel);
+        const Eigen::Vector3d bg = dlio::smoother::bias_sensor_from_bl(
+            this->extrinsics.baselink2imu.R, this->state.b.gyro);
+        this->smoother_->setBiasPrior(ba, bg);
+        this->smoother_bias_seeded_ = true;
+        std::lock_guard<std::mutex> print_lock(this->print_mutex_);
+        printf("[SMOOTH] bias prior from this run's %.1f s init, SENSOR frame: "
+               "accel (%.8f, %.8f, %.8f) m/s^2  gyro (%.8f, %.8f, %.8f) rad/s "
+               "sigma_a=%.4g sigma_g=%.4g (a seed, not an assertion; there is "
+               "NO clamp and NO rail on it anywhere in the graph)\n",
+               this->imu_calib_time_, ba(0), ba(1), ba(2), bg(0), bg(1), bg(2),
+               this->smoother_params_.bias_prior_sigma_accel,
+               this->smoother_params_.bias_prior_sigma_gyro);
+        fflush(stdout);
+      }
       if (this->geo_abias_margin_ > 0.0) {
         std::lock_guard<std::mutex> print_lock(this->print_mutex_);
         printf("[REPAIR] abias clamp DERIVED from this run's %.1f s init "
@@ -1455,9 +1697,22 @@ void dlio::OdomNode::getNextPose() {
   // Geometric observer update
   this->updateState();
 
+  // --- E4 / ARCHITECT A: THE NUDGE ------------------------------------------
+  // HERE, and not one statement later. deskewPointcloud() builds scan k+1's
+  // prior from lidarPose and geo.prev_vel and it runs BEFORE getNextPose() in
+  // the next callback, so a correction written here is already in the next
+  // prior; a correction written anywhere downstream is not. Nothing has read
+  // the state yet: updateKeyframes(), buildSubmap(), publishPose() and
+  // publishToROS() all run after this returns, and every one of them inherits
+  // the corrected transform for free.
+  this->smootherUpdate();
+
   // Report AFTER the update, so the computed weights and the applied metres in
-  // the same [DEGEN] line belong to the same scan.
+  // the same [DEGEN] line belong to the same scan. The [DEGEN] line describes
+  // the REGISTRATION, and it still does: Tq/Tp, H6w/H6b, dp6 and corr6 were all
+  // captured in scoreDegeneracy(), before the nudge existed for this scan.
   this->logDegeneracy();
+  this->logSmoother();
 
 }
 
@@ -1749,6 +2004,301 @@ void dlio::OdomNode::logDegeneracy() {
             this->degen_params_.min_info, this->degen_params_.full_info,
             this->degen_params_.max_weak_dirs, this->degen_params_.min_corr);
     fflush(stderr);
+  }
+}
+
+
+// ===========================================================================
+//  E4 / ARCHITECT A -- THE NUDGE.  include/dlio/smoother.h has the design.
+// ===========================================================================
+
+// One scan in, one solve, and the SIX WRITES.
+//
+// The correction has to reach the thing the registration is measured AGAINST,
+// not only the state: the anchor (lidarPose, geo.prev_vel) and the map (the
+// submap keyframes). A correction written into state alone survives exactly one
+// scan and reads as a null result -- which is this design's most probable
+// defect and the reason write_back() reports what it did.
+void dlio::OdomNode::smootherUpdate() {
+
+  if (!this->smoother_) return;
+
+  dlio::smoother::ScanInput in;
+  in.stamp      = this->scan_stamp;
+  in.prev_stamp = this->prev_scan_stamp;
+  // The registration's own pose for this scan, T = T_corr * T_prior, read here
+  // -- after align(), after propagateGICP(), after updateState(), and before
+  // anything downstream has seen it. The guard's optional pose adjustment
+  // cannot have moved it: arming the guard and the smoother together is refused
+  // in the constructor, because two actions on one scan are unattributable.
+  in.T_gicp  = this->T.cast<double>();
+  in.H6b     = dlio::degeneracy::from_upper21(this->degen_h_.Hb);
+  in.h_valid = this->degen_h_.valid;
+  in.ncorr   = this->degen_h_.ncorr;
+  in.ferr    = this->degen_h_.ferr;
+  in.dp6     = this->degen_dp6_;
+  in.dp6_valid = this->degen_dp6_valid_;
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    in.v_world = this->state.v.lin.w.cast<double>();
+  }
+  {
+    // The RAW samples of this scan interval. p50 64 at 640 Hz.
+    std::lock_guard<std::mutex> lk(this->mtx_raw_imu_);
+    in.imu.reserve(96);
+    for (const auto& r : this->raw_imu_buffer_) {
+      if (r.stamp > in.prev_stamp && r.stamp <= in.stamp) {
+        dlio::smoother::ImuSample sm;
+        sm.stamp = r.stamp;
+        sm.accel = r.accel;
+        sm.gyro  = r.gyro;
+        in.imu.push_back(sm);
+      }
+    }
+  }
+
+  this->smoother_sol_ = this->smoother_->update(in);
+  ++this->smoother_scans_;
+  this->smoother_solve_ms_.push_back(this->smoother_sol_.solve_ms);
+  if (this->smoother_sol_.solve_ms > this->smoother_solve_ms_max_) {
+    this->smoother_solve_ms_max_ = this->smoother_sol_.solve_ms;
+  }
+
+  // FREEZE ON MARGINALISATION. Every keyframe whose scan left the window on
+  // this update is frozen here, so a later delta offered to it is REFUSED and
+  // counted rather than silently applied to a pose the graph no longer owns.
+  if (!this->smoother_sol_.kf_frozen.empty()) {
+    std::lock_guard<std::mutex> lk(this->kf_delta_mutex_);
+    for (int i : this->smoother_sol_.kf_frozen) {
+      if (i >= 0 && i < (int)this->kf_frozen_.size()) this->kf_frozen_[i] = 1;
+    }
+  }
+
+  // --- THE SIX WRITES, all under geo.mtx, all or none --------------------
+  dlio::smoother::WriteTargets t;
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    t.T             = &this->T;
+    t.T_corr        = &this->T_corr;
+    t.T_prior       = &this->T_prior;
+    t.lidar_p       = &this->lidarPose.p;
+    t.lidar_q       = &this->lidarPose.q;
+    t.state_p       = &this->state.p;
+    t.state_q       = &this->state.q;
+    t.v_world       = &this->state.v.lin.w;
+    t.v_body        = &this->state.v.lin.b;
+    t.geo_prev_p    = &this->geo.prev_p;
+    t.geo_prev_q    = &this->geo.prev_q;
+    t.geo_prev_vel  = &this->geo.prev_vel;
+    t.b_accel_bl    = &this->state.b.accel;
+    t.b_gyro_bl     = &this->state.b.gyro;
+    t.kf            = this->smoother_params_.keyframe_writeback
+                          ? (dlio::smoother::KeyframeSink*)this->kf_sink_.get()
+                          : nullptr;
+    t.kf_dirty_trans_m = this->smoother_params_.kf_dirty_trans_m;
+    t.kf_dirty_rot_deg = this->smoother_params_.kf_dirty_rot_deg;
+    t.R_bl_imu      = this->extrinsics.baselink2imu.R;
+    this->smoother_rep_ = dlio::smoother::write_back(t, this->smoother_sol_,
+                                                     this->smoother_params_.alpha);
+  }
+  this->smoother_ledger_.note(this->smoother_sol_, this->smoother_rep_);
+}
+
+// The [SMOOTH] record. One line per scan, its own units= token, and the
+// silent-no-op law underneath it. The run must be able to SHOW it did
+// something: solve time, window size, the correction it applied in metres and
+// degrees, the marginal's own spectrum, alpha, and the two factor residuals
+// side by side so a reader can see WHICH one moved.
+void dlio::OdomNode::logSmoother() {
+
+  if (!this->smoother_) return;
+
+  const dlio::smoother::Solution& S = this->smoother_sol_;
+  const dlio::smoother::WriteBackReport& W = this->smoother_rep_;
+  const int every = std::max(1, this->smoother_params_.log_every);
+  if ((this->smoother_scans_ % every) == 0) {
+    std::lock_guard<std::mutex> print_lock(this->print_mutex_);
+    printf("[SMOOTH] t=%.4f k=%ld valid=%d solved=%d solve_ms=%.3f "
+           "win_vars=%d win_fac=%d lm=%d lag_s=%.2f "
+           "alpha=%.4f corr_m=%.6f corr_deg=%.6f app_m=%.6f app_deg=%.6f "
+           "groups=%d kfw=%d kffz=%d "
+           "mcov=%.6g,%.6g,%.6g,%.6g,%.6g,%.6g "
+           "r_imu=%.6g r_reg=%.6g regf=%d hvalid=%d ncorr=%d "
+           "imu_n=%d imu_gaps=%d floor=%d psd=%d exc=%d "
+           "s_rot=%.9g s_trans=%.9g "
+           "n=%ld computed=%ld applied=%ld kf_applied=%ld kf_refused=%ld "
+           "units=solve_ms:ms;corr_m:m;corr_deg:deg;app_m:m;app_deg:deg;"
+           "mcov:VARIANCE_diag_of_the_marginal_on_X_k_in_gtsam_Pose3_tangent_"
+           "rot0to2_rad2_trans3to5_m2;r_imu:whitened_factor_error_CombinedImu;"
+           "r_reg:whitened_factor_error_BetweenPose3_after_Huber;"
+           "s_rot:rad^-2_per_corr_count_times_m2;s_trans:m^-2_per_corr_count;"
+           "win_vars:variables_in_the_fixed_lag_window;win_fac:factors;"
+           "groups:WRITE_GROUPS_of_6_T_lidarPose_state_geoprev_bias_keyframes;"
+           "kfw:in_window_keyframes_moved_THIS_scan;"
+           "kffz:keyframes_that_LEFT_the_window_THIS_scan;"
+           "alpha:BLEND_never_fitted_0_runs_and_writes_nothing\n",
+           this->scan_stamp, (long)this->smoother_scans_ - 1, (int)S.valid,
+           (int)S.solved_this_scan, S.solve_ms, S.window_vars, S.window_factors,
+           S.lm_iterations, this->smoother_params_.lag_s,
+           this->smoother_params_.alpha, W.corr_m, W.corr_deg, W.applied_m,
+           W.applied_deg, W.groups_written, W.kf_written,
+           (int)S.kf_frozen.size(), S.marg_cov[0], S.marg_cov[1], S.marg_cov[2],
+           S.marg_cov[3], S.marg_cov[4], S.marg_cov[5], S.resid_imu, S.resid_reg,
+           (int)this->degen_dp6_valid_, (int)this->degen_h_.valid,
+           this->degen_h_.ncorr, S.imu_samples, S.imu_gaps,
+           (int)S.floor_binding, (int)S.psd_projected, (int)S.update_exception,
+           this->smoother_params_.info_scale_rot,
+           this->smoother_params_.info_scale_trans,
+           this->smoother_ledger_.scans, this->smoother_ledger_.computed,
+           this->smoother_ledger_.applied,
+           (long)this->smoother_kf_applied_, (long)this->smoother_kf_refused_);
+    fflush(stdout);
+  }
+
+  // --- SILENT NO-OP LAW ----------------------------------------------------
+  // COMPUTED = scans on which the smoother produced a correction above 1 mm.
+  // APPLIED  = scans on which the state actually moved. computed > 0 &&
+  // applied == 0 is a HARD ERROR -- unless alpha == 0, where applied == 0 is
+  // the POINT and the law binds the other way: the smoother must still have
+  // COMPUTED, or the A/A control is measuring nothing.
+  if (!this->smoother_noop_reported_) {
+    const std::string v =
+        this->smoother_ledger_.violation(this->smoother_params_.alpha);
+    if (!v.empty()) {
+      this->smoother_noop_reported_ = true;
+      fprintf(stderr, "[SMOOTH][ERROR] %s\n", v.c_str());
+      fflush(stderr);
+    }
+  }
+  // A keyframe delta offered to a FROZEN keyframe is a broken invariant, not a
+  // skip: the window and the map disagree about which poses are still owned.
+  if (this->smoother_rep_.kf_frozen_refused > 0) {
+    this->smoother_kf_refused_ += this->smoother_rep_.kf_frozen_refused;
+    fprintf(stderr,
+            "[SMOOTH][ERROR] %d delta(s) were offered to a keyframe that has "
+            "already left the smoother's window (frozen). A marginalised pose "
+            "must never move again -- that is what makes the kd-tree rebuild "
+            "bounded. Scan k=%ld.\n",
+            this->smoother_rep_.kf_frozen_refused,
+            (long)this->smoother_scans_ - 1);
+    fflush(stderr);
+  }
+}
+
+// --- the keyframe sink ------------------------------------------------------
+
+bool dlio::OdomNode::KfSink::poseOf(int kf_index, Eigen::Matrix4d* out) const {
+  std::lock_guard<std::mutex> lk(this->node->kf_delta_mutex_);
+  if (kf_index < 0 || kf_index >= (int)this->node->kf_pose_now_.size()) return false;
+  if (out) *out = this->node->kf_pose_now_[kf_index];
+  return true;
+}
+
+bool dlio::OdomNode::KfSink::queueDelta(int kf_index, const Eigen::Matrix4d& delta,
+                                        const Eigen::Matrix4d& pose_new) {
+  std::lock_guard<std::mutex> lk(this->node->kf_delta_mutex_);
+  if (kf_index < 0 || kf_index >= (int)this->node->kf_frozen_.size()) return false;
+  if (this->node->kf_frozen_[kf_index]) return false;   // FROZEN: refuse, loudly
+  // Deltas COMPOSE: the submap builder is asynchronous and may not have drained
+  // the previous one yet, so a second correction to the same keyframe in the
+  // same build interval must multiply onto the first, never replace it.
+  if (this->node->kf_has_delta_[kf_index]) {
+    this->node->kf_pending_delta_[kf_index] =
+        delta * this->node->kf_pending_delta_[kf_index];
+  } else {
+    this->node->kf_pending_delta_[kf_index] = delta;
+    this->node->kf_has_delta_[kf_index] = 1;
+  }
+  this->node->kf_pose_now_[kf_index] = pose_new;
+  return true;
+}
+
+void dlio::OdomNode::KfSink::markSubmapDirty() {
+  this->node->smoother_submap_dirty_ = true;
+}
+
+// Applied on the submap-build thread, BEFORE the new keyframes are baked and
+// before buildSubmap() composes. Two cases, and confusing them would double-
+// apply the correction:
+//   i  < num_processed_keyframes : the cloud is ALREADY in the world frame
+//                                  (buildKeyframesAndSubmap baked it once and
+//                                  dropped the raw), so the delta moves the
+//                                  cloud and the covariances directly.
+//   i >= num_processed_keyframes : the cloud is still the raw current_scan and
+//                                  keyframe_transformations[i] is what will
+//                                  bake it -- so the delta goes into THAT and
+//                                  the cloud is left alone.
+// A world->world delta is exact and needs no raw cloud: it is the same
+// std::transform buildKeyframesAndSubmap already runs, at one 4x4 per point.
+void dlio::OdomNode::applyKeyframeDeltas() {
+
+  if (!this->smoother_ || !this->smoother_params_.keyframe_writeback) return;
+
+  std::vector<int> idx;
+  std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> del;
+  {
+    std::lock_guard<std::mutex> lk(this->kf_delta_mutex_);
+    for (std::size_t i = 0; i < this->kf_has_delta_.size(); ++i) {
+      if (!this->kf_has_delta_[i]) continue;
+      idx.push_back((int)i);
+      del.push_back(this->kf_pending_delta_[i]);
+      this->kf_has_delta_[i] = 0;
+      this->kf_pending_delta_[i] = Eigen::Matrix4d::Identity();
+    }
+    this->smoother_submap_dirty_ = false;
+  }
+  if (idx.empty()) return;
+
+  long applied = 0;
+  {
+    std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
+    for (std::size_t n = 0; n < idx.size(); ++n) {
+      const int i = idx[n];
+      if (i < 0 || i >= (int)this->keyframes.size()) continue;
+      const Eigen::Matrix4d& Dd = del[n];
+      const Eigen::Matrix4f D = Dd.cast<float>();
+      const Eigen::Matrix3f DR = D.block<3, 3>(0, 0);
+
+      Eigen::Vector3f p = this->keyframes[i].first.first;
+      Eigen::Quaternionf q = this->keyframes[i].first.second;
+      Eigen::Vector3f p2 = DR * p + D.block<3, 1>(0, 3);
+      Eigen::Quaternionf q2 = Eigen::Quaternionf(DR) * q;
+      q2.normalize();
+      this->keyframes[i].first = std::make_pair(p2, q2);
+      this->keyframe_transformations[i] = D * this->keyframe_transformations[i];
+
+      if (i < this->num_processed_keyframes) {
+        pcl::PointCloud<PointType>::Ptr moved
+            (boost::make_shared<pcl::PointCloud<PointType>>());
+        pcl::transformPointCloud(*this->keyframes[i].second, *moved, D);
+        this->keyframes[i].second = moved;
+        std::shared_ptr<nano_gicp::CovarianceList> cov
+            (std::make_shared<nano_gicp::CovarianceList>(
+                this->keyframe_normals[i]->size()));
+        std::transform(this->keyframe_normals[i]->begin(),
+                       this->keyframe_normals[i]->end(), cov->begin(),
+                       [&Dd](Eigen::Matrix4d c) { return Dd * c * Dd.transpose(); });
+        this->keyframe_normals[i] = cov;
+      }
+      ++applied;
+    }
+  }
+
+  if (applied > 0) {
+    this->smoother_kf_applied_ = this->smoother_kf_applied_.load() + applied;
+    // MARK THE SUBMAP DIRTY. buildSubmap() only recomposes when the INDEX SET
+    // changed; a member that MOVED leaves the set identical, so without this
+    // the registration keeps aiming at the unmoved cloud and the correction is
+    // undone by the very measurement it was meant to reweigh. Clearing prev
+    // forces the recomposition and, with it, the kd-tree rebuild -- lazily, on
+    // the next align, which is the existing cost at a higher frequency and not
+    // a new one.
+    this->submap_kf_idx_prev.clear();
+    std::lock_guard<std::mutex> print_lock(this->print_mutex_);
+    printf("[SMOOTH] submap DIRTY: %ld in-window keyframe(s) moved, submap will "
+           "be recomposed and the kd-tree rebuilt on the next align "
+           "units=keyframes\n", applied);
+    fflush(stdout);
   }
 }
 
@@ -2461,6 +3011,24 @@ void dlio::OdomNode::updateKeyframes() {
     this->keyframe_timestamps.push_back(this->scan_header_stamp);
     this->keyframe_normals.push_back(this->gicp.getSourceCovariances());
     this->keyframe_transformations.push_back(this->T_corr);
+
+    // --- E4: register the keyframe with the smoother. A keyframe IS a scan, so
+    // there is no new variable: the smoother records which of its own keys this
+    // keyframe's pose IS, and reads it back while that key is still inside the
+    // window. The parallel vectors below are the map side of the same fact.
+    {
+      std::lock_guard<std::mutex> lk(this->kf_delta_mutex_);
+      this->kf_pending_delta_.push_back(Eigen::Matrix4d::Identity());
+      this->kf_has_delta_.push_back(0);
+      Eigen::Matrix4d P0 = Eigen::Matrix4d::Identity();
+      P0.block<3, 3>(0, 0) = this->lidarPose.q.toRotationMatrix().cast<double>();
+      P0.block<3, 1>(0, 3) = this->lidarPose.p.cast<double>();
+      this->kf_pose_now_.push_back(P0);
+      this->kf_frozen_.push_back(0);
+    }
+    if (this->smoother_) {
+      this->smoother_->noteKeyframe((int)this->keyframes.size() - 1);
+    }
     lock.unlock();
 
   }
@@ -2679,6 +3247,14 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
 }
 
 void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state) {
+
+  // --- E4: LAZY, and here on purpose. The smoother queues a world->world delta
+  // per in-window keyframe on the lidar thread; it is applied HERE, on the
+  // async submap thread, before the new keyframes are baked and before the
+  // submap is composed -- so the kd-tree is rebuilt at most once per build and
+  // never on the callback's critical path. Sub-floor motion never gets this
+  // far: write_back() drops a delta below 5 mm / 0.05 deg.
+  this->applyKeyframeDeltas();
 
   // transform the new keyframe(s) and associated covariance list(s)
     std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
