@@ -69,7 +69,9 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
                                   this->extrinsics.baselink2imu.t.cast<double>());
     printf("[SMOOTH] ARMED  %s  lag_s=%.2f alpha=%.3f "
            "info_scale_rot=%.9g info_scale_trans=%.9g huber_k=%.3f "
-           "floor=(%.3g deg, %.3g m) marginalize_every=%d kf_writeback=%d\n",
+           "floor=(%.3g deg, %.3g m) marginalize_every=%d kf_writeback=%d "
+           "reanchor=%d anchor_in_graph=%d anchor=(%.4g m, %.4g deg) "
+           "blend_increment=%d\n",
            this->smoother_->versionString().c_str(),
            this->smoother_params_.lag_s, this->smoother_params_.alpha,
            this->smoother_params_.info_scale_rot,
@@ -77,12 +79,40 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
            this->smoother_params_.floor_sigma_rot_deg,
            this->smoother_params_.floor_sigma_trans_m,
            this->smoother_params_.marginalize_every,
-           (int)this->smoother_params_.keyframe_writeback);
+           (int)this->smoother_params_.keyframe_writeback,
+           (int)this->smoother_params_.reanchor,
+           (int)this->smoother_params_.anchor_in_graph,
+           this->smoother_params_.anchor_sigma_pos_m,
+           this->smoother_params_.anchor_sigma_rot_deg,
+           (int)this->smoother_params_.blend_increment);
     // The raw tap feeds gtsam the sample as it arrived; imu_accel_sm_ is DLIO's
     // accelerometer scale-misalignment matrix and it is applied to the buffered
     // copy only. Identity is the shipped value and the only one this tap is
     // correct for, so a non-identity one must stop the run rather than be
     // silently ignored.
+    // E4 INCREMENT 2. The increment-1 configuration -- absolute blend with the
+    // gauge free to 10 m -- is a MEASURED defect, not a preference: at alpha = 0
+    // the smoother's marginal sat 49.2 mm from DLIO's own pose with 0.33 mm/scan
+    // new, and blending that at alpha = 0.5 injected a constant bias every scan,
+    // laid keyframes at 10x the stock rate and ran 1,329 km before the OOM
+    // killer (E4/REVIEW.md). It is refused rather than warned about, because a
+    // warning in a 40-minute replay's log is not a gate. `:smoother-1` and its
+    // pin still exist and still run it, which is where that arm is reproduced.
+    if (this->smoother_params_.alpha > 0.0 &&
+        !this->smoother_params_.reanchor &&
+        !this->smoother_params_.blend_increment) {
+      fprintf(stderr,
+              "[SMOOTH][ERROR] alpha=%.3f with dlio/smoother/reanchor FALSE and "
+              "dlio/smoother/blend_increment FALSE is the increment-1 write-back, "
+              "and what it blends is a STANDING FRAME OFFSET (49.2 mm, 0.33 mm/"
+              "scan new, measured at alpha = 0 where nothing is written) rather "
+              "than a correction. Set reanchor: true (re-anchor the window on "
+              "DLIO's own pose, the default) or blend_increment: true (blend the "
+              "one-scan increment). Refusing to run the configuration that was "
+              "measured to diverge.\n", this->smoother_params_.alpha);
+      fflush(stderr);
+      ros::shutdown();
+    }
     if (!this->imu_accel_sm_.isIdentity(1e-9)) {
       fprintf(stderr,
               "[SMOOTH][ERROR] dlio/imu/intrinsics/accel/sm is not the identity "
@@ -364,9 +394,16 @@ dlio::OdomNode::~OdomNode() {
            "exceptions=%ld reseats=%ld kf_applied=%ld kf_refused=%ld raw_imu=%ld "
            "solve_ms p50=%.3f p95=%.3f p99=%.3f max=%.3f mean=%.3f "
            "budget_100ms_exceeded=%ld verdict=%s floored=%ld "
+           "anchored=%ld standing=%ld measured=%ld "
            "units=solve_ms:ms;budget:scans_whose_solve_exceeded_the_100_ms_"
-           "scan_period;floored=solved_scans_whose_registration_information_"
-           "was_the_CONSTANT_FLOOR_a_majority_is_an_ERROR\n",
+           "scan_period_ALSO_DERIVABLE_PER_SCAN_FROM_solve_ms_because_THIS_"
+           "LINE_IS_PRINTED_FROM_THE_DESTRUCTOR_AND_A_SIGKILL_NEVER_REACHES_IT;"
+           "floored=solved_scans_whose_registration_information_"
+           "was_the_CONSTANT_FLOOR_a_majority_is_an_ERROR;"
+           "anchored=scans_on_which_the_window_was_RE_ANCHORED_on_DLIOs_own_"
+           "pose;standing=scans_WITH_registration_whose_absolute_offset_from_"
+           "DLIOs_pose_exceeded_standing_offset_max_m_a_majority_at_alpha_0_"
+           "is_an_ERROR;measured=the_denominator_of_standing\n",
            this->smoother_ledger_.scans, this->smoother_ledger_.solved,
            this->smoother_ledger_.computed, this->smoother_ledger_.applied,
            this->smoother_ledger_.exceptions, this->smoother_ledger_.reseats,
@@ -376,7 +413,8 @@ dlio::OdomNode::~OdomNode() {
            (long)std::count_if(v.begin(), v.end(),
                                [](double x) { return x > 100.0; }),
            viol.empty() ? "OK" : "SILENT-NO-OP",
-           this->smoother_ledger_.floored);
+           this->smoother_ledger_.floored, this->smoother_ledger_.anchored,
+           this->smoother_ledger_.standing, this->smoother_ledger_.measured);
     fflush(stdout);
   }
 }
@@ -563,6 +601,22 @@ void dlio::OdomNode::getParams() {
                               S.gauge_sigma_yaw_deg, 10.0);
     ros::param::param<double>("~dlio/smoother/gauge_sigma_pos_m",
                               S.gauge_sigma_pos_m, 10.0);
+    // --- E4 INCREMENT 2: the re-anchor, and the increment-blend ablation ----
+    // reanchor DEFAULTS TRUE and the two sigmas REPLACE the 10 m gauge above:
+    // increment 1 shipped with the gauge free to 10 m and the smoother's
+    // absolute pose drifted 49.2 mm from DLIO's and STAYED there, which is
+    // what the write-back was then blending. See E4/REVIEW.md sec 8.1.
+    ros::param::param<bool>  ("~dlio/smoother/reanchor", S.reanchor, true);
+    ros::param::param<bool>  ("~dlio/smoother/anchor_in_graph",
+                              S.anchor_in_graph, false);
+    ros::param::param<double>("~dlio/smoother/anchor_sigma_pos_m",
+                              S.anchor_sigma_pos_m, 0.001);
+    ros::param::param<double>("~dlio/smoother/anchor_sigma_rot_deg",
+                              S.anchor_sigma_rot_deg, 0.01);
+    ros::param::param<bool>  ("~dlio/smoother/blend_increment",
+                              S.blend_increment, false);
+    ros::param::param<double>("~dlio/smoother/standing_offset_max_m",
+                              S.standing_offset_max_m, 0.002);
     ros::param::param<double>("~dlio/smoother/v0_sigma", S.v0_sigma, 0.5);
     ros::param::param<double>("~dlio/smoother/bias_prior_sigma_accel",
                               S.bias_prior_sigma_accel, 0.05);
@@ -592,6 +646,7 @@ void dlio::OdomNode::getParams() {
       fflush(stderr);
       S.alpha = std::min(1.0, std::max(0.0, S.alpha));
     }
+    this->smoother_ledger_.standing_max_m = S.standing_offset_max_m;
   }
 
   std::vector<float> accel_default{0., 0., 0.}; std::vector<float> prior_accel_bias;
@@ -2325,8 +2380,14 @@ void dlio::OdomNode::smootherUpdate() {
     t.kf_dirty_trans_m = this->smoother_params_.kf_dirty_trans_m;
     t.kf_dirty_rot_deg = this->smoother_params_.kf_dirty_rot_deg;
     t.R_bl_imu      = this->extrinsics.baselink2imu.R;
-    this->smoother_rep_ = dlio::smoother::write_back(t, this->smoother_sol_,
-                                                     this->smoother_params_.alpha);
+    this->smoother_rep_ = dlio::smoother::write_back(
+        t, this->smoother_sol_, this->smoother_params_.alpha,
+        this->smoother_params_.blend_increment);
+    // THE ANCHOR MUST SEE WHAT DLIO ENDED UP WITH, not what it came in with:
+    // the re-anchor pins the window on DLIO's own chain, and after the six
+    // writes that chain holds T_hat, not T_gicp. At alpha = 0 these are the
+    // same object and the same bits.
+    this->smoother_->noteApplied(this->T.cast<double>());
   }
   this->smoother_ledger_.note(this->smoother_sol_, this->smoother_rep_);
 }
@@ -2354,6 +2415,8 @@ void dlio::OdomNode::logSmoother() {
            "imu_n=%d imu_gaps=%d floor=%d psd=%d exc=%d reseats=%ld "
            "s_rot=%.9g s_trans=%.9g "
            "n=%ld computed=%ld applied=%ld kf_applied=%ld kf_refused=%ld "
+           "tgt_m=%.6f tgt_deg=%.6f anch_k=%ld anch_m=%.6f anch_deg=%.6f "
+           "reanch=%d incmode=%d standing=%ld measured=%ld "
            "units=solve_ms:ms;corr_m:m;corr_deg:deg;app_m:m;app_deg:deg;"
            "mcov:VARIANCE_diag_of_the_marginal_on_X_k_in_gtsam_Pose3_tangent_"
            "rot0to2_rad2_trans3to5_m2;r_imu:whitened_factor_error_CombinedImu;"
@@ -2365,7 +2428,17 @@ void dlio::OdomNode::logSmoother() {
            "kffz:keyframes_that_LEFT_the_window_THIS_scan;"
            "reseats:fixed_lag_windows_REBUILT_after_a_failed_update_"
            "cumulative_a_run_with_any_is_not_a_clean_arm;"
-           "alpha:BLEND_never_fitted_0_runs_and_writes_nothing\n",
+           "alpha:BLEND_never_fitted_0_runs_and_writes_nothing;"
+           "corr_m:THE_ABSOLUTE_offset_between_the_smoother_marginal_and_DLIOs_"
+           "own_pose_for_THIS_scan_DIAGNOSTIC_at_alpha0_its_p50_must_be_under_"
+           "2mm_and_its_lag10_autocorrelation_under_0.5;"
+           "tgt_m:what_the_nudge_AIMS_AT_equals_corr_under_reanchor_and_the_one_"
+           "scan_increment_disagreement_under_blend_increment;"
+           "anch_k:the_in_window_scan_key_RE_ANCHORED_on_DLIOs_own_pose_THIS_"
+           "scan_minus1_means_none;anch_m:how_far_that_anchor_moved_the_window_"
+           "BEFORE_the_solve_ie_the_gauge_drift_this_clause_removes;"
+           "standing:scans_WITH_registration_whose_corr_m_exceeded_"
+           "standing_offset_max_m;measured:the_denominator_of_standing\n",
            this->scan_stamp, (long)this->smoother_scans_ - 1, (int)S.valid,
            (int)S.solved_this_scan, S.solve_ms, S.window_vars, S.window_factors,
            S.lm_iterations, this->smoother_params_.lag_s,
@@ -2381,7 +2454,11 @@ void dlio::OdomNode::logSmoother() {
            this->smoother_params_.info_scale_trans,
            this->smoother_ledger_.scans, this->smoother_ledger_.computed,
            this->smoother_ledger_.applied,
-           (long)this->smoother_kf_applied_, (long)this->smoother_kf_refused_);
+           (long)this->smoother_kf_applied_, (long)this->smoother_kf_refused_,
+           W.target_m, W.target_deg, (long)S.anchor_key, S.anchor_resid_m,
+           S.anchor_resid_deg, (int)this->smoother_params_.reanchor,
+           (int)this->smoother_params_.blend_increment,
+           this->smoother_ledger_.standing, this->smoother_ledger_.measured);
     fflush(stdout);
   }
 

@@ -144,6 +144,17 @@ int main(int argc, char** argv) {
   P.gauge_sigma_rp_deg = get("gauge_sigma_rp_deg", P.gauge_sigma_rp_deg);
   P.gauge_sigma_yaw_deg = get("gauge_sigma_yaw_deg", P.gauge_sigma_yaw_deg);
   P.gauge_sigma_pos_m = get("gauge_sigma_pos_m", P.gauge_sigma_pos_m);
+  // E4 INCREMENT 2. THE REPLAY DEFAULTS THESE OFF, and that is deliberate: this
+  // binary's job is the offline A/A against E0's python refit (IMPL.md sec 6.4),
+  // and E0's graph has the 10 m gauge and no re-anchor. Turning either on here
+  // would silently change the trajectory the A/A compares. They are settable so
+  // the SAME recorded tape can be replayed both ways and the standing offset
+  // measured on it, at zero node cost.
+  P.reanchor = get("reanchor", 0.0) != 0.0;
+  P.blend_increment = get("blend_increment", 0.0) != 0.0;
+  P.anchor_sigma_pos_m = get("anchor_sigma_pos_m", P.anchor_sigma_pos_m);
+  P.anchor_sigma_rot_deg = get("anchor_sigma_rot_deg", P.anchor_sigma_rot_deg);
+  P.standing_offset_max_m = get("standing_offset_max_m", P.standing_offset_max_m);
   P.v0_sigma = get("v0_sigma", P.v0_sigma);
   P.bias_prior_sigma_accel = get("bias_prior_sigma_accel", P.bias_prior_sigma_accel);
   P.bias_prior_sigma_gyro = get("bias_prior_sigma_gyro", P.bias_prior_sigma_gyro);
@@ -255,8 +266,9 @@ int main(int argc, char** argv) {
       dlio::smoother::WriteTargets t;
       Eigen::Matrix4f Tf = in.T_gicp.cast<float>();
       t.T = &Tf;
-      rep = dlio::smoother::write_back(t, sol, P.alpha);
+      rep = dlio::smoother::write_back(t, sol, P.alpha, P.blend_increment);
     }
+    ledger.standing_max_m = P.standing_offset_max_m;
     ledger.note(sol, rep);
 
     // overwrite every in-window scan's estimate; what survives at the end is
@@ -294,7 +306,10 @@ int main(int argc, char** argv) {
        << "," << sol.marg_cov[2] << "," << sol.marg_cov[3] << ","
        << sol.marg_cov[4] << "," << sol.marg_cov[5] << "],\"floor\":"
        << (sol.floor_binding ? 1 : 0) << ",\"psd\":" << (sol.psd_projected ? 1 : 0)
-       << ",\"exc\":" << (sol.update_exception ? 1 : 0) << "}\n";
+       << ",\"exc\":" << (sol.update_exception ? 1 : 0)
+       << ",\"tgt_m\":" << rep.target_m << ",\"tgt_deg\":" << rep.target_deg
+       << ",\"anch_k\":" << sol.anchor_key << ",\"anch_m\":" << sol.anchor_resid_m
+       << ",\"ncorr\":" << r.ncorr << "}\n";
   }
   fp.close();
   fs.close();

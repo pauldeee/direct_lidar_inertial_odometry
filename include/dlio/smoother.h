@@ -210,6 +210,70 @@ struct Params {
   double gauge_sigma_rp_deg  = 0.5;
   double gauge_sigma_yaw_deg = 10.0;
   double gauge_sigma_pos_m   = 10.0;
+
+  // --- E4 INCREMENT 2: THE WINDOW IS RE-ANCHORED ON DLIO'S OWN POSE -------
+  //
+  // WHY THIS EXISTS, measured, not argued (E4/REVIEW.md sec 8.1, PROOF.md
+  // sec 7). With the gauge prior above and nothing else, the window's ABSOLUTE
+  // placement is free to 10 m and the marginalisation prior carries almost
+  // nothing along a corridor's unobservable axis -- so the smoother's estimate
+  // of scan k sits at a STANDING FRAME OFFSET from DLIO's own pose for scan k:
+  // measured at alpha = 0, where the write-back writes NOTHING and therefore
+  // cannot have caused what it is measuring, it stands at 49.2 mm and only
+  // 0.33 mm of it is new each scan (lag-10 autocorrelation 0.988). The
+  // write-back then blends alpha x THAT into lidarPose, state, geo.prev_* and
+  // the map, ten times a second, against a real motion of ~20 mm per scan: a
+  // constant bias injected every scan, keyframes at 10x the stock rate, and
+  // 1,329 km of trajectory before the OOM killer.
+  //
+  // THE FIX, and it is the cheap one. Put a TIGHT prior on the OLDEST pose
+  // that will SURVIVE this update, at DLIO's own value for that scan. The
+  // window's gauge is then DLIO's own frame BY CONSTRUCTION, the standing
+  // offset is identically zero, and what remains in `corr` is only the
+  // window's own disagreement about the SHAPE of the last lag_s seconds --
+  // which is the quantity this design was always supposed to blend. It touches
+  // no write: the six writes are unchanged.
+  //
+  // 1 mm / 0.01 deg is not a fitted band. It is "tight enough that the anchor
+  // wins against a marginalisation prior whose weak axis reaches 1.5e6 m^2",
+  // and the fixture asserts the offset it removes, not the number itself.
+  bool   reanchor = true;
+  // HOW the anchor is imposed, and the two are NOT equivalent -- measured:
+  //
+  //  anchor_in_graph = FALSE (the default, "output"): the window's gauge is
+  //    left exactly as E0 built it and the ANSWER is re-expressed in DLIO's
+  //    frame -- X_out(k) = T_dlio(k_a) . X(k_a)^-1 . X(k), a rigid gauge
+  //    transform applied to the pose, the velocity and the in-window keyframe
+  //    poses together. The standing offset is then ZERO BY CONSTRUCTION (the
+  //    anchor pose is DLIO's own, exactly), the graph's conditioning is
+  //    untouched, and nothing accumulates.
+  //
+  //  anchor_in_graph = TRUE ("prior"): a tight PriorFactor on that same pose,
+  //    at DLIO's own value, replacing the 10 m gauge. This is the literal form
+  //    E4/REVIEW.md sec 8.1 names, it is built, and it is NOT the default,
+  //    because it does not survive its own closed-loop fixture: the anchor
+  //    that is marginalised out leaves its TIGHT absolute information inside
+  //    the marginalisation prior, the next scan's anchor sits at a DLIO pose
+  //    that the write-back has since moved, and the two tight and mutually
+  //    inconsistent absolute constraints fight -- on the synthetic corridor
+  //    replay at alpha = 0.5 it reaches 40 m of correction where the gauge
+  //    transform reaches millimetres (test_smoother_gtsam.cpp G10/G11). It is
+  //    kept, behind this key, because "the obvious form of the fix diverges"
+  //    is a result and deleting it would leave nothing to read it off.
+  bool   anchor_in_graph = false;
+  double anchor_sigma_pos_m   = 0.001;   // 1 mm   (anchor_in_graph only)
+  double anchor_sigma_rot_deg = 0.01;    // 0.01 deg
+  // THE ABLATION, PROOF.md sec 7 option (a): blend the smoother's own
+  // INCREMENT X(k-1)^-1 X(k) onto DLIO's own T_{k-1}^-1 T_k instead of its
+  // absolute pose. Frame-offset-free whatever the gauge does, and it is here
+  // so the increment can attribute the result to the re-anchoring rather than
+  // assert it. Not the default: (b) is, because (b) also repairs the map
+  // write-back and the marginal, and (a) only repairs the pose.
+  bool   blend_increment = false;
+  // At alpha = 0 the smoother's marginal must TRACK DLIO's pose. Scans where
+  // it does not, and the registration was present, are counted; the majority
+  // of them is the defect above. PROOF.md sec 7's own fixture threshold.
+  double standing_offset_max_m = 0.002;
   double v0_sigma            = 0.5;    // m/s
   double bias_prior_sigma_accel = 0.05;   // m/s^2   -- a seed, not an assertion
   double bias_prior_sigma_gyro  = 0.005;  // rad/s
@@ -320,6 +384,28 @@ struct Solution {
                                // scratch after a failed update. Bounded and
                                // COUNTED; a run with any is not a clean arm.
   bool   solved_this_scan = false;   // false on the scans marginalize_every skips
+
+  // --- E4 INCREMENT 2 -------------------------------------------------------
+  // The window's own relative motion over the LAST SCAN, and DLIO's, in the
+  // same chart. Both are gauge-free by construction, which is the whole point:
+  // PROOF.md sec 7 option (a) blends their difference instead of the absolute
+  // pose, and the [SMOOTH] record carries it either way so a reader can see
+  // how much of `corr` was frame and how much was motion.
+  Eigen::Matrix4d T_rel_smoother = Eigen::Matrix4d::Identity();  // X(k-1)^-1 X(k)
+  Eigen::Matrix4d T_rel_dlio     = Eigen::Matrix4d::Identity();  // T_{k-1}^-1 T_k
+  bool   rel_valid = false;
+  // The pose the window was re-anchored on this scan, and how far the anchor
+  // had to move it. anchor_key < 0 means no anchor was added on this scan
+  // (either reanchor is off, or the window's oldest survivor is unchanged).
+  long   anchor_key = -1;
+  bool   anchor_added = false;
+  // the world->world gauge the output re-anchor applied. Identity when the
+  // re-anchor is off or in the graph, and the keyframe poses above have
+  // ALREADY been carried through it -- pose, velocity and map move together or
+  // the gauge is just the old defect wearing a new name.
+  Eigen::Matrix4d anchor_gauge = Eigen::Matrix4d::Identity();
+  double anchor_resid_m = 0.0;   // |DLIO's pose - the window's own| at the anchor
+  double anchor_resid_deg = 0.0;
 };
 
 // ------------------------------------------------------- the information ---
@@ -435,11 +521,25 @@ struct WriteTargets {
 struct WriteBackReport {
   bool   applied = false;
   double alpha = 0.0;
-  double corr_m = 0.0,    corr_deg = 0.0;      // the FULL smoother correction
+  // THE DIAGNOSTIC, and it is NOT what gets blended any more. |T_gicp^-1 X(k)|
+  // -- the ABSOLUTE difference between the smoother's estimate of scan k and
+  // DLIO's own pose for scan k. Under the increment-1 design this WAS the
+  // correction and it was a standing frame offset (49.2 mm at alpha = 0,
+  // 0.33 mm/scan new). It stays on the record because it is the number the
+  // sec 7 fixture reads: at alpha = 0 its p50 must be under 2 mm and its
+  // lag-10 autocorrelation under 0.5, and a run where it is not has a gauge
+  // problem whatever the trajectory says.
+  double corr_m = 0.0,    corr_deg = 0.0;
+  // WHAT THE NUDGE ACTUALLY AIMS AT: |T_gicp^-1 T_target|. Equal to corr under
+  // (b) with the window re-anchored -- which is the point, the two agree only
+  // when the frame offset is gone -- and equal to the one-scan increment
+  // disagreement under (a).
+  double target_m = 0.0,  target_deg = 0.0;
   double applied_m = 0.0, applied_deg = 0.0;   // what alpha actually moved
   int    kf_written = 0;
   int    kf_frozen_refused = 0;
   int    groups_written = 0;                   // MUST be 6 when applied
+  bool   increment_mode = false;               // (a) was used, not (b)
 };
 
 // b_baselink = R_bl_imu * b_sensor. R is proved against /ouster/metadata to
@@ -460,14 +560,55 @@ inline Eigen::Vector3d bias_sensor_from_bl(const Eigen::Matrix3f& R_bl_imu,
 // [[silent_no_op_law]] on the report, and test_smoother.cpp asserts each group
 // individually with a sabotage that turns it red.
 inline WriteBackReport write_back(const WriteTargets& t, const Solution& sol,
-                                  double alpha) {
+                                  double alpha, bool blend_increment = false) {
   WriteBackReport rep;
   rep.alpha = alpha;
+  rep.increment_mode = blend_increment;
   if (!sol.valid) return rep;
 
   Eigen::Matrix4d T_gicp = Eigen::Matrix4d::Identity();
   if (t.T) T_gicp = t.T->cast<double>();
   pose_difference(T_gicp, sol.T, &rep.corr_m, &rep.corr_deg);
+
+  // --- WHAT THE NUDGE AIMS AT (E4 increment 2) ------------------------------
+  //
+  // (b) THE DEFAULT -- sol.T itself, because the window it came out of is
+  //     re-anchored on DLIO's own pose at its oldest surviving scan, so
+  //     sol.T is DLIO's frame plus the window's own shape correction and
+  //     nothing else. Nothing here changes; what changed is the graph.
+  //
+  // (a) THE ABLATION (dlio/smoother/blend_increment) -- compose the smoother's
+  //     own increment onto DLIO's previous pose:
+  //         T_target = T_dlio(k-1) . D_sm
+  //                  = T_gicp(k) . D_dlio^-1 . D_sm
+  //     which cancels every frame the two estimates might disagree about and
+  //     leaves only the ONE SCAN of relative motion they disagree about. It is
+  //     an ablation and not the default because it repairs the pose only: the
+  //     keyframes, which the sixth write moves, are still absolute, so (a)
+  //     also has to carry the same world->world gauge shift onto them (below)
+  //     and the marginal it reports is still in the drifted frame.
+  Eigen::Matrix4d T_target = sol.T;
+#if DLIO_SMOOTHER_SABOTAGE == 9
+  const bool gauge_shift = false;      // the map is left in the old frame
+#else
+  const bool gauge_shift = blend_increment && sol.rel_valid;
+#endif
+#if DLIO_SMOOTHER_SABOTAGE != 8
+  if (blend_increment) {
+    T_target = sol.rel_valid
+                   ? Eigen::Matrix4d(T_gicp * (sol.T_rel_dlio.inverse() *
+                                               sol.T_rel_smoother))
+                   : T_gicp;     // scan 0: there is no increment yet
+  }
+#endif
+  pose_difference(T_gicp, T_target, &rep.target_m, &rep.target_deg);
+  // the world->world rigid shift (a) has to carry onto the map as well, so the
+  // keyframes and the pose do not end up in two different frames. Under (b) it
+  // is the identity by construction and is not computed at all, so (b)'s
+  // keyframe arithmetic is bit-for-bit the increment-1 arithmetic.
+  const Eigen::Matrix4d G = gauge_shift
+                                ? Eigen::Matrix4d(T_target * sol.T.inverse())
+                                : Eigen::Matrix4d::Identity();
 
   // alpha == 0: the smoother RUNS, LOGS EVERYTHING, AND WRITES NOTHING. This is
   // the mandatory A/A rung and the offline instrument in one, and it is the only
@@ -478,7 +619,7 @@ inline WriteBackReport write_back(const WriteTargets& t, const Solution& sol,
   if (alpha == 0.0) return rep;
 #endif
 
-  const Eigen::Matrix4d T_hat = blend_pose(T_gicp, sol.T, alpha);
+  const Eigen::Matrix4d T_hat = blend_pose(T_gicp, T_target, alpha);
   pose_difference(T_gicp, T_hat, &rep.applied_m, &rep.applied_deg);
   const Eigen::Matrix4f T_hat_f = T_hat.cast<float>();
   const Eigen::Matrix3f R_hat = T_hat_f.block<3, 3>(0, 0);
@@ -544,7 +685,9 @@ inline WriteBackReport write_back(const WriteTargets& t, const Solution& sol,
     for (const auto& kp : sol.kf_poses) {
       Eigen::Matrix4d old;
       if (!t.kf->poseOf(kp.first, &old)) continue;
-      const Eigen::Matrix4d target = blend_pose(old, kp.second, alpha);
+      const Eigen::Matrix4d kf_hat = gauge_shift ? Eigen::Matrix4d(G * kp.second)
+                                                 : kp.second;
+      const Eigen::Matrix4d target = blend_pose(old, kf_hat, alpha);
       double dm = 0.0, dd = 0.0;
       pose_difference(old, target, &dm, &dd);
       if (dm < t.kf_dirty_trans_m && dd < t.kf_dirty_rot_deg) continue;
@@ -596,9 +739,25 @@ struct NoOpLedger {
   long floored_streak = 0;
   long floored_streak_max = 0;
   long window_poses = 0;
+  // E4 INCREMENT 2, the law's THIRD clause: the smoother's ABSOLUTE marginal
+  // against DLIO's own pose, counted only where the registration was actually
+  // there. `measured` is the denominator (solved scans with the floor NOT
+  // binding -- a window with no correspondences may legitimately disagree by
+  // metres and that is not a gauge defect); `standing` is how many of those
+  // exceeded the design's own 2 mm. Cheap: two counters, no history.
+  long standing = 0;
+  long measured = 0;
+  double standing_max_m = 0.002;
+  // and how many scans were re-anchored, so a run can show the clause ran
+  long anchored = 0;
 
   void note(const Solution& sol, const WriteBackReport& rep) {
     ++scans;
+    if (sol.anchor_added) ++anchored;
+    if (sol.solved_this_scan && sol.valid && !sol.floor_binding) {
+      ++measured;
+      if (rep.corr_m > standing_max_m) ++standing;
+    }
     if (sol.solved_this_scan) ++solved;
     if (sol.solved_this_scan) {
       window_poses = sol.window_vars / 3;
@@ -640,6 +799,34 @@ struct NoOpLedger {
       if (applied != 0)
         return "alpha = 0 and the state MOVED on " + std::to_string(applied) +
                " scans. The A/A control is not a control.";
+      // E4 INCREMENT 2, the law's THIRD clause, and it is the one that would
+      // have stopped increment 1 before a single node draw. At alpha = 0 the
+      // smoother writes NOTHING, so its estimate of scan k cannot have been
+      // moved by anything this code did: if it nevertheless sits far from
+      // DLIO's own pose for scan k, on the MAJORITY of the scans where the
+      // registration was actually present, then the quantity the write-back
+      // blends at alpha > 0 is A STANDING FRAME OFFSET AND NOT A CORRECTION.
+      // Increment 1 measured 49.2 mm of it with 0.33 mm/scan new, blended
+      // alpha x that into lidarPose, state, geo.prev_* and the map ten times a
+      // second, and ran 1,329 km before the OOM killer. The floor-binding
+      // scans are excluded on purpose: a window with no correspondences in it
+      // may legitimately disagree with the registration by metres, and that is
+      // clause 2's subject, not this one.  [[silent_no_op_law]]
+#if DLIO_SMOOTHER_SABOTAGE != 7
+      if (measured > 0 && standing * 2 > measured)
+        return "alpha = 0 and the smoother's ABSOLUTE marginal sat more than " +
+               std::to_string(standing_max_m * 1e3) +
+               " mm from DLIO's own pose on " + std::to_string(standing) +
+               " of " + std::to_string(measured) +
+               " scans that HAD registration -- the MAJORITY. At alpha = 0 the "
+               "write-back writes nothing, so this cannot be something this "
+               "code did: it is a STANDING FRAME OFFSET, and blending alpha x "
+               "it into lidarPose, state, geo.prev_* and the map is injecting "
+               "a constant bias every scan, not applying a correction. Check "
+               "dlio/smoother/reanchor (the window must be pinned on DLIO's "
+               "own pose at its oldest surviving scan) and "
+               "dlio/smoother/anchor_sigma_pos_m.";
+#endif
       return std::string();
     }
     if (computed > 0 && applied == 0)
@@ -706,6 +893,19 @@ class Smoother {
   // registered so a later solve can report their smoothed pose while they are
   // still inside the window.
   Solution update(const ScanInput& in);
+
+  // E4 INCREMENT 2. THE POSE DLIO ACTUALLY ENDED UP HOLDING for the scan just
+  // passed to update(), i.e. what write_back() wrote. Called from
+  // smootherUpdate() immediately after the six writes, under the same geo.mtx.
+  //
+  // WHY IT IS NOT OPTIONAL. The re-anchor pins the window on "DLIO's own pose"
+  // at the oldest surviving scan. update() only ever sees the pose BEFORE that
+  // scan's write-back, so without this call the anchor would sit alpha x one
+  // correction behind the chain DLIO is really running -- and the smoother
+  // would re-derive, and re-apply, the same correction every scan for a whole
+  // window. At alpha = 0 write_back() writes nothing and T_applied is
+  // identically T_gicp, so the A/A control is untouched either way.
+  void noteApplied(const Eigen::Matrix4d& T_applied);
 
   // Register a keyframe laid at the scan just passed to update(). Called from
   // updateKeyframes(), which runs after getNextPose().

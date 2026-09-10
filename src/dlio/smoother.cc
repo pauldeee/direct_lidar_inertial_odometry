@@ -22,6 +22,15 @@
 //       random walk lives inside the same factor.
 //   F3  the gauge prior on X(0)/V(0)/B(0) -- the gravity/attitude anchoring:
 //       tight in roll and pitch, loose but non-singular in yaw and x/y/z.
+//   F3' THE RE-ANCHOR (E4 increment 2). A TIGHT prior on the oldest pose that
+//       will SURVIVE this update, at DLIO's own value for that scan. Without
+//       it F3's 10 m gauge lets the window's absolute placement drift away
+//       from DLIO's chain and stay there -- measured at alpha = 0, where the
+//       write-back writes nothing: 49.2 mm standing, 0.33 mm/scan new, lag-10
+//       autocorrelation 0.988 (E4/REVIEW.md sec 8.1) -- and the write-back
+//       then blends THAT into the filter every scan. With it, the window's
+//       gauge IS DLIO's frame and `corr` measures only the window's own
+//       disagreement about the shape of the last lag_s seconds.
 //   F4  the marginalisation prior, produced by the fixed-lag smoother itself.
 //       Its spectrum goes on the [SMOOTH] line from day one, because
 //       new-ct.md R3 names it as "the fourth sink" in a programme that has
@@ -72,6 +81,26 @@ inline Eigen::Matrix4d mat_of(const gtsam::Pose3& p) {
   T.block<3, 3>(0, 0) = p.rotation().matrix();
   T.block<3, 1>(0, 3) = p.translation();
   return T;
+}
+
+// The sigmas of the prior that seeds a chain -- at k = 0 and after a re-seat.
+// With the re-anchor ON this IS the anchor: X(0) is pinned at DLIO's own pose,
+// so the window's gauge is DLIO's frame from the first scan and never has a
+// 10 m free placement to drift into. With it OFF this is E0's own gauge prior,
+// value for value, which is what the increment-1 arm ran.
+inline Eigen::Matrix<double, 6, 1> gauge_sigmas(const dlio::smoother::Params& P) {
+  Eigen::Matrix<double, 6, 1> gs;
+  if (P.reanchor && P.anchor_in_graph) {
+    const double r = P.anchor_sigma_rot_deg * M_PI / 180.0;
+    gs << r, r, r, P.anchor_sigma_pos_m, P.anchor_sigma_pos_m,
+        P.anchor_sigma_pos_m;
+  } else {
+    gs << P.gauge_sigma_rp_deg * M_PI / 180.0,
+        P.gauge_sigma_rp_deg * M_PI / 180.0,
+        P.gauge_sigma_yaw_deg * M_PI / 180.0, P.gauge_sigma_pos_m,
+        P.gauge_sigma_pos_m, P.gauge_sigma_pos_m;
+  }
+  return gs;
 }
 
 }  // namespace
@@ -153,6 +182,14 @@ struct Smoother::Impl {
   long reseats = 0;
   long singular_info = 0;
   bool singular_reported = false;
+
+  // --- E4 INCREMENT 2: the re-anchor ---------------------------------------
+  // DLIO's OWN pose for every scan key still live, and that key's window
+  // timestamp. Both are pruned to the window on every update, so this is
+  // O(window), not O(run).
+  std::map<long, Eigen::Matrix4d> dlio_pose;
+  std::map<long, double> key_time;
+  long anchored_upto = -1;   // the newest key that has already been anchored
 };
 
 Smoother::Smoother(const Params& p) : params_(p), impl_(new Impl(p)) {}
@@ -164,6 +201,12 @@ void Smoother::setBiasPrior(const Eigen::Vector3d& a, const Eigen::Vector3d& g) 
 
 void Smoother::setExtrinsic(const Eigen::Matrix3d& R, const Eigen::Vector3d& t) {
   impl_->setExtrinsic(R, t);
+}
+
+void Smoother::noteApplied(const Eigen::Matrix4d& T_applied) {
+  if (impl_->k < 0) return;
+  if (!T_applied.allFinite()) return;      // a broken write never becomes an anchor
+  impl_->dlio_pose[impl_->k] = T_applied;
 }
 
 void Smoother::noteKeyframe(int kf_index) {
@@ -267,16 +310,14 @@ Solution Smoother::update(const ScanInput& in) {
     // accelerometer constrains roll and pitch inside every F2 factor, so a
     // second gravity opinion inside the window would be an unforced risk
     // (A_nudge sec 3.3 F5, deliberately not built).
-    Eigen::Matrix<double, 6, 1> gs;
-    gs << P.gauge_sigma_rp_deg * M_PI / 180.0, P.gauge_sigma_rp_deg * M_PI / 180.0,
-        P.gauge_sigma_yaw_deg * M_PI / 180.0, P.gauge_sigma_pos_m,
-        P.gauge_sigma_pos_m, P.gauge_sigma_pos_m;
+    const Eigen::Matrix<double, 6, 1> gs = gauge_sigmas(P);
     Eigen::Matrix<double, 6, 1> bs;
     bs << P.bias_prior_sigma_accel, P.bias_prior_sigma_accel,
         P.bias_prior_sigma_accel, P.bias_prior_sigma_gyro,
         P.bias_prior_sigma_gyro, P.bias_prior_sigma_gyro;
     I.k = 0;
     I.t0 = in.stamp;
+    if (P.reanchor && P.anchor_in_graph) I.anchored_upto = 0;   // X(0) IS the anchor
     I.pending_f.addPrior(KX(0), Tg, gtsam::noiseModel::Diagonal::Sigmas(gs));
     I.pending_f.addPrior(KV(0), gtsam::Vector3(v_init),
                          gtsam::noiseModel::Isotropic::Sigma(3, P.v0_sigma));
@@ -287,6 +328,8 @@ Solution Smoother::update(const ScanInput& in) {
     I.pending_t[KX(0)] = 0.0;
     I.pending_t[KV(0)] = 0.0;
     I.pending_t[KB(0)] = 0.0;
+    I.key_time[0] = 0.0;
+    I.dlio_pose[0] = in.T_gicp;
   } else if (I.needs_reseat) {
     // RE-SEAT. Bounded and reported, never silent. The key numbering continues
     // so the keyframe map and the log stay readable; what restarts is the
@@ -299,10 +342,9 @@ Solution Smoother::update(const ScanInput& in) {
     ++I.reseats;
     for (const auto& kv : I.kf_key) out.kf_frozen.push_back(kv.first);
     I.kf_key.clear();
-    Eigen::Matrix<double, 6, 1> gs;
-    gs << P.gauge_sigma_rp_deg * M_PI / 180.0, P.gauge_sigma_rp_deg * M_PI / 180.0,
-        P.gauge_sigma_yaw_deg * M_PI / 180.0, P.gauge_sigma_pos_m,
-        P.gauge_sigma_pos_m, P.gauge_sigma_pos_m;
+    I.key_time.clear();
+    if (P.reanchor && P.anchor_in_graph) I.anchored_upto = k;   // X(k) IS the anchor
+    const Eigen::Matrix<double, 6, 1> gs = gauge_sigmas(P);
     Eigen::Matrix<double, 6, 1> bs;
     bs << P.bias_prior_sigma_accel, P.bias_prior_sigma_accel,
         P.bias_prior_sigma_accel, P.bias_prior_sigma_gyro,
@@ -318,6 +360,8 @@ Solution Smoother::update(const ScanInput& in) {
     I.pending_t[KX(k)] = tk;
     I.pending_t[KV(k)] = tk;
     I.pending_t[KB(k)] = tk;
+    I.key_time[k] = tk;
+    I.dlio_pose[k] = in.T_gicp;
     I.last_imu.reset();
     I.last_reg.reset();
     std::fprintf(stderr,
@@ -392,11 +436,65 @@ Solution Smoother::update(const ScanInput& in) {
     I.pending_t[KX(k)] = tk;
     I.pending_t[KV(k)] = tk;
     I.pending_t[KB(k)] = tk;
+    I.key_time[k] = tk;
+    I.dlio_pose[k] = in.T_gicp;
   }
 
   const long k = I.k;
   const int every = std::max(1, P.marginalize_every);
   const bool do_solve = (k == 0) || ((k % every) == 0);
+
+  // ---- F3': RE-ANCHOR THE WINDOW ON DLIO'S OWN POSE (E4 increment 2) -------
+  //
+  // The oldest pose that will SURVIVE this update gets a TIGHT prior at DLIO's
+  // own value for that scan. gtsam's BatchFixedLagSmoother marginalises every
+  // key whose timestamp is strictly older than (newest - lag), so the survivor
+  // is the smallest key at or after that cut. Each key is anchored AT MOST ONCE
+  // -- the cut advances monotonically, so exactly one anchor is live at a time
+  // and the previous one has already been absorbed into the marginalisation
+  // prior. Adding it repeatedly to the same key would multiply its information
+  // by the number of scans it stayed oldest, which is not a prior, it is a
+  // count.
+  //
+  // WHAT IT DOES NOT DO: it does not pin the window's SHAPE. Every pose newer
+  // than the anchor is as free as it was, so the arbitration -- the IMU chain
+  // against the registration, over lag_s seconds -- is unchanged. What it
+  // removes is the one degree of freedom the design never wanted: where the
+  // whole window sits.
+  if (do_solve && P.reanchor && P.anchor_in_graph && k > 0) {
+    const double tk = in.stamp - I.t0;
+    const double t_cut = tk - P.lag_s;
+    long k_anchor = -1;
+    for (const auto& kv : I.key_time) {
+      if (kv.second >= t_cut) { k_anchor = kv.first; break; }
+    }
+    // k_anchor == k would pin THIS scan, i.e. hand the whole window back to
+    // the registration; that can only happen if the lag is shorter than one
+    // scan period, and it is refused rather than silently applied.
+    if (k_anchor >= 0 && k_anchor < k && k_anchor > I.anchored_upto &&
+        I.dlio_pose.count(k_anchor)) {
+      const gtsam::Pose3 Xa = pose_of(I.dlio_pose[k_anchor]);
+      Eigen::Matrix<double, 6, 1> as;
+      const double ar = P.anchor_sigma_rot_deg * M_PI / 180.0;
+      as << ar, ar, ar, P.anchor_sigma_pos_m, P.anchor_sigma_pos_m,
+          P.anchor_sigma_pos_m;
+      I.pending_f.addPrior(KX(k_anchor), Xa,
+                           gtsam::noiseModel::Diagonal::Sigmas(as));
+      I.anchored_upto = k_anchor;
+      out.anchor_key = k_anchor;
+      out.anchor_added = true;
+      // how far the anchor had to move the window, BEFORE the solve -- the
+      // gauge drift this clause is removing, per scan, on the record.
+      try {
+        const Eigen::Matrix4d Xw =
+            mat_of(I.sm->calculateEstimate<gtsam::Pose3>(KX(k_anchor)));
+        pose_difference(I.dlio_pose[k_anchor], Xw, &out.anchor_resid_m,
+                        &out.anchor_resid_deg);
+      } catch (const std::exception& e) {
+        out.anchor_resid_m = out.anchor_resid_deg = -1.0;
+      }
+    }
+  }
 
   if (do_solve) {
     try {
@@ -426,18 +524,94 @@ Solution Smoother::update(const ScanInput& in) {
   }
 
   // ---- read the marginal for THIS scan ------------------------------------
+  // T_graph is the answer IN THE WINDOW'S OWN FRAME and out.T is the answer in
+  // DLIO's. They differ by the gauge below, and every quantity that has to be
+  // consistent with the GRAPH -- the two factor residuals, the window's own
+  // increment -- is computed from T_graph, never from out.T.
+  Eigen::Matrix4d T_graph = Eigen::Matrix4d::Identity();
   try {
     const gtsam::Pose3 Xk = I.sm->calculateEstimate<gtsam::Pose3>(KX(k));
     const gtsam::Vector3 Vk = I.sm->calculateEstimate<gtsam::Vector3>(KV(k));
     const gtsam::imuBias::ConstantBias Bk =
         I.sm->calculateEstimate<gtsam::imuBias::ConstantBias>(KB(k));
     out.T = mat_of(Xk);
+    T_graph = out.T;
     out.v = Vk;
     out.b_accel = Bk.accelerometer();
     out.b_gyro = Bk.gyroscope();
     out.valid = out.T.allFinite() && out.v.allFinite();
   } catch (const std::exception& e) {
     out.valid = false;
+  }
+
+  // ---- F3'' RE-ANCHOR AS A GAUGE TRANSFORM (the default) -------------------
+  //
+  // The window's own gauge is left exactly as E0 built it -- loose, and free to
+  // wander, which inside a fixed-lag window is the correct thing for it to be.
+  // What is fixed is the ANSWER: the window is re-expressed in DLIO's own frame
+  // by the rigid transform that carries the window's estimate of its oldest
+  // surviving pose onto DLIO's own pose for that same scan.
+  //
+  //     G   = T_dlio(k_a) . X(k_a)^-1                (world <- world)
+  //     X_out(k) = G . X(k),   v_out = R_G . v,   kf_out = G . kf
+  //
+  // At k = k_a this is an identity by construction, which is the sense in which
+  // the standing offset is zero: the window and DLIO agree EXACTLY about where
+  // the window starts, and `corr` at the newest scan is then the window's own
+  // disagreement about the SHAPE of the last lag_s seconds and nothing else.
+  //
+  // Pose, velocity and keyframes are transformed TOGETHER -- a gauge that moved
+  // the pose and left the map behind would be the same defect in a new costume.
+  // marg_cov is a variance in the local tangent and G is a rigid motion, so the
+  // translation block is rotated, not scaled; it is left as the graph reported
+  // it and the record says so in its units token.
+  if (out.valid && P.reanchor && !P.anchor_in_graph && k > 0) {
+    const double tk = in.stamp - I.t0;
+    const double t_cut = tk - P.lag_s;
+    long k_a = -1;
+    for (const auto& kv : I.key_time) {
+      if (kv.second >= t_cut && I.dlio_pose.count(kv.first)) { k_a = kv.first; break; }
+    }
+    if (k_a >= 0 && k_a < k) {
+      try {
+        const Eigen::Matrix4d Xa =
+            mat_of(I.sm->calculateEstimate<gtsam::Pose3>(KX(k_a)));
+        const Eigen::Matrix4d G = I.dlio_pose[k_a] * Xa.inverse();
+        if (G.allFinite()) {
+          pose_difference(I.dlio_pose[k_a], Xa, &out.anchor_resid_m,
+                          &out.anchor_resid_deg);
+          out.T = G * out.T;
+          out.v = G.block<3, 3>(0, 0) * out.v;
+          out.anchor_key = k_a;
+          out.anchor_added = true;
+          out.anchor_gauge = G;
+          out.valid = out.T.allFinite() && out.v.allFinite();
+        }
+      } catch (const std::exception& e) {
+        // the oldest survivor cannot be read: leave the answer in the window's
+        // own frame rather than in a frame nobody can name, and say so
+        out.anchor_key = -2;
+      }
+    }
+  }
+
+  // ---- the window's own INCREMENT over the last scan, and DLIO's ----------
+  // Both gauge-free: whatever frame the window is in cancels in X(k-1)^-1 X(k),
+  // and DLIO's own frame cancels in T_{k-1}^-1 T_k. This is what option (a)
+  // blends, and it is on the record either way so a reader can see how much of
+  // `corr` was the frame and how much was the motion. It costs one estimate
+  // read of a key that is already in the window.
+  if (out.valid && k > 0 && I.dlio_pose.count(k - 1) && I.dlio_pose.count(k)) {
+    try {
+      const Eigen::Matrix4d Xkm =
+          mat_of(I.sm->calculateEstimate<gtsam::Pose3>(KX(k - 1)));
+      const Eigen::Matrix4d& Dp = I.dlio_pose[k - 1];
+      out.T_rel_smoother = Xkm.inverse() * T_graph;
+      out.T_rel_dlio = Dp.inverse() * I.dlio_pose[k];
+      out.rel_valid = out.T_rel_smoother.allFinite() && out.T_rel_dlio.allFinite();
+    } catch (const std::exception& e) {
+      out.rel_valid = false;      // the previous key has left the window
+    }
   }
 
   // ---- the marginal's own spectrum. new-ct.md R3 names the marginalisation
@@ -475,8 +649,9 @@ Solution Smoother::update(const ScanInput& in) {
     try {
       gtsam::Values v;
       const long kp = std::max(0L, k - 1);
-      v.insert(KX(k), pose_of(out.T));
-      v.insert(KV(k), gtsam::Vector3(out.v));
+      v.insert(KX(k), pose_of(T_graph));
+      v.insert(KV(k), gtsam::Vector3(
+                          impl_->sm->calculateEstimate<gtsam::Vector3>(KV(k))));
       v.insert(KB(k), gtsam::imuBias::ConstantBias(out.b_accel, out.b_gyro));
       if (kp != k) {
         v.insert(KX(kp), I.sm->calculateEstimate<gtsam::Pose3>(KX(kp)));
@@ -508,13 +683,32 @@ Solution Smoother::update(const ScanInput& in) {
       if (key != k) {
         try {
           out.kf_poses.emplace_back(
-              it->first, mat_of(I.sm->calculateEstimate<gtsam::Pose3>(KX(key))));
+              it->first,
+              Eigen::Matrix4d(out.anchor_gauge *
+                              mat_of(I.sm->calculateEstimate<gtsam::Pose3>(KX(key)))));
         } catch (const std::exception& e) {
           // a key inside the window that cannot be read is a defect, not a skip
           out.update_exception = true;
         }
       }
       ++it;
+    }
+  }
+
+  // ---- prune the re-anchor's side maps to the window ----------------------
+  // O(window), not O(run): a key that has left the window can never be
+  // anchored again and its DLIO pose is never read again. k and k-1 are kept
+  // unconditionally -- k-1 is what the increment needs and it may already have
+  // been marginalised on a very short lag.
+  {
+    const auto& stamps = I.sm->timestamps();
+    for (auto it = I.key_time.begin(); it != I.key_time.end();) {
+      if (it->first >= k - 1 || stamps.find(KX(it->first)) != stamps.end()) {
+        ++it;
+      } else {
+        I.dlio_pose.erase(it->first);
+        it = I.key_time.erase(it);
+      }
     }
   }
 
