@@ -392,6 +392,27 @@ private:
   // before anyone proposes an action on it.
   dlio::degeneracy::RotRecord degen_rot_;
 
+  // E2 -- THE TRUE 6x6 (dlio/degeneracy.h hessian_record). Read-only, like the
+  // rotation record above and for the same reason: E0 fitted its attitude
+  // weight on rlam, which is anchored at the WORLD ORIGIN, and the fit came out
+  // 6.62x apart between the big bag and Dave against a 6.85 ratio of squared
+  // distances to that origin. The cross block cancels that lever arm exactly
+  // and no summary of the two diagonal blocks can (E2.md). Nothing acts on it.
+  dlio::degeneracy::HessianRecord degen_h_;
+  // The GICP pose of the PREVIOUS scored scan, so the record can carry the
+  // registration's own relative pose -- the measurement a BetweenFactor wants -
+  // instead of only |dp|. Taken at scoreDegeneracy(), i.e. BEFORE the optional
+  // guard_pose adjustment; on every arm this lane runs guard_pose is false and
+  // the two coincide, which is stated rather than assumed.
+  Eigen::Matrix4f degen_T_prev_;
+  bool            degen_T_prev_valid_;
+  Eigen::Matrix<double, 6, 1> degen_dp6_;    // rel. pose prev->this, [rotvec ; t]
+  bool            degen_dp6_valid_;         // false on the first scored scan only
+  Eigen::Matrix<double, 6, 1> degen_corr6_;  // T_prior -> T, the registration's own correction
+  Eigen::Matrix<double, 6, 1> degen_innov6_; // state -> lidarPose, the observer innovation
+  std::atomic<long> degen_h6_written_;       // lines actually carrying a valid 6x6 (APPLIED)
+  bool degen_h6_noop_reported_;              // one-shot: scored for a whole run, never dumped
+
   // (N57) the accel-bias clamp derived from THIS run's 3 s init calibration.
   double geo_abias_margin_;                  // 0 = off = the constant below
   Eigen::Vector3f geo_abias_clamp_;          // what updateState() actually uses

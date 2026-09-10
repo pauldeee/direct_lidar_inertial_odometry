@@ -149,6 +149,18 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
   this->degen_noop_reported_ = false;
   this->degen_blind_reported_ = false;
 
+  // E2 -- the true 6x6 record. Instrumentation only; every field starts empty
+  // and a run that never scores prints nothing new.
+  this->degen_h_ = dlio::degeneracy::HessianRecord();
+  this->degen_T_prev_.setIdentity();
+  this->degen_T_prev_valid_ = false;
+  this->degen_dp6_valid_ = false;
+  this->degen_dp6_.setZero();
+  this->degen_corr6_.setZero();
+  this->degen_innov6_.setZero();
+  this->degen_h6_written_ = 0;
+  this->degen_h6_noop_reported_ = false;
+
   // INCREMENT 1 repairs (dlio/repairs.h). Every counter starts at zero and the
   // clamp starts at the CONFIGURED constant, so a run that arms nothing is the
   // stock run with three more numbers printed.
@@ -1482,6 +1494,49 @@ void dlio::OdomNode::scoreDegeneracy() {
   // onset is a heading error, and a column that does not exist cannot be fitted.
   this->degen_rot_ = dlio::degeneracy::rotation_record(H, this->gicp.hasFinalHessian());
 
+  // E2 -- THE TRUE 6x6, and the registration's own relative pose.
+  //
+  // Same H, same scan, same validity gate as the two eigen-summary records
+  // above; what is added is the 21 free entries of the matrix ITSELF, both as
+  // nano_gicp built it (WORLD/LEFT, anchored at the world origin) and
+  // re-anchored on the sensor in GTSAM's RIGHT/BODY Pose3 tangent. The second
+  // is the quantity a smoother can use; the first is kept so the conversion is
+  // CHECKABLE offline against this same line's lam/rlam, rather than trusted.
+  //
+  // (R, t) is THIS scan's GICP pose `T = T_corr * T_prior`, read here -- after
+  // align(), before the optional guard_pose adjustment and before
+  // propagateGICP() copies it into lidarPose. That is the pose at which the
+  // Hessian was linearised, which is the only pose the adjoint may use.
+  const Eigen::Matrix3d R_w = this->T.block<3,3>(0,0).cast<double>();
+  const Eigen::Vector3d t_w = this->T.block<3,1>(0,3).cast<double>();
+  this->degen_h_ = dlio::degeneracy::hessian_record(
+      H, this->gicp.hasFinalHessian(), R_w, t_w,
+      this->gicp.getFinalError(), this->gicp.num_correspondences);
+
+  // The registration's own correction to the IMU prior, as a 6-VECTOR rather
+  // than the |dp| scalar beside it: T_prior -> T, expressed in T_prior's frame.
+  // This is the quantity `innov` is the observer-side counterpart of, and the
+  // one a chi-square against the 6x6 above is taken on.
+  this->degen_corr6_ = dlio::degeneracy::relative_rot_trans(
+      this->T_prior.block<3,3>(0,0).cast<double>(),
+      this->T_prior.block<3,1>(0,3).cast<double>(), R_w, t_w);
+
+  // The scan-to-scan GICP relative pose, T_{k-1}^-1 T_k -- the MEASUREMENT a
+  // BetweenFactor<Pose3> takes. E0 had to substitute the exported pose chain
+  // for it (its S2), which is the observer's output and differs from this by
+  // exactly `innov`; this field removes that substitution. Zero and flagged
+  // invalid on the first scored scan, which has no predecessor.
+  this->degen_dp6_valid_ = this->degen_T_prev_valid_;
+  if (this->degen_dp6_valid_) {
+    this->degen_dp6_ = dlio::degeneracy::relative_rot_trans(
+        this->degen_T_prev_.block<3,3>(0,0).cast<double>(),
+        this->degen_T_prev_.block<3,1>(0,3).cast<double>(), R_w, t_w);
+  } else {
+    this->degen_dp6_.setZero();
+  }
+  this->degen_T_prev_ = this->T;
+  this->degen_T_prev_valid_ = true;
+
   const dlio::degeneracy::Weights& W = this->degen_w_;
   ++this->degen_scans_;
   if (!W.valid) ++this->degen_invalid_;
@@ -1491,6 +1546,26 @@ void dlio::OdomNode::scoreDegeneracy() {
   this->degen_ratio_min_  = W.valid ? W.ratio_min()  : 1.;
   this->degen_w_min_      = W.w_min();
 
+}
+
+// E2 -- number formatting for the [DEGEN] line's vector fields.
+//
+// %.17g, not %.6g: these are not a human-readable summary, they are the INPUT
+// to an offline solve. A Hessian entry rounded to six figures cannot be checked
+// against the eigenvalues printed beside it, and the whole point of dumping the
+// matrix is that the reconstruction E0 had to use can be compared with the
+// truth. 17 significant digits round-trips an IEEE double exactly.
+//
+// Writes into a caller-owned buffer and is called OUTSIDE the print lock, so
+// the locked region still holds exactly one printf and one flush.
+static void fmt_doubles(char* buf, size_t n, const double* v, int count) {
+  size_t off = 0;
+  for (int i = 0; i < count && off < n; ++i) {
+    const int w = snprintf(buf + off, n - off, i ? ",%.17g" : "%.17g", v[i]);
+    if (w < 0) break;
+    off += (size_t)w;
+  }
+  if (n) buf[n - 1] = '\0';
 }
 
 // Report the scan just scored. Called AFTER updateState() so `removed` is THIS
@@ -1509,6 +1584,22 @@ void dlio::OdomNode::logDegeneracy() {
     // implicit is how a forced-threshold smoke run gets mistaken for what the
     // defaults do. `rm` is this scan's metres, `RM` the run's cumulative total.
     // Under print_mutex_ so a flush cannot land inside a status-banner line.
+    // E2 -- format the vector fields BEFORE taking the lock, so the locked
+    // region is still exactly one printf and a flush. 26 chars is the widest a
+    // %.17g double plus its separator can be.
+    char h6w[21 * 26], h6b[21 * 26], dp6[6 * 26], corr6[6 * 26], innov6[6 * 26];
+    fmt_doubles(h6w, sizeof(h6w), this->degen_h_.Hw, 21);
+    fmt_doubles(h6b, sizeof(h6b), this->degen_h_.Hb, 21);
+    fmt_doubles(dp6, sizeof(dp6), this->degen_dp6_.data(), 6);
+    fmt_doubles(corr6, sizeof(corr6), this->degen_corr6_.data(), 6);
+    fmt_doubles(innov6, sizeof(innov6), this->degen_innov6_.data(), 6);
+    const int dp6_valid = this->degen_dp6_valid_ ? 1 : 0;
+    // The pose the adjoint was taken at: THIS scan's GICP pose, captured in
+    // scoreDegeneracy() before the optional guard_pose adjustment. Printed so a
+    // reader can rebuild Ad(T) and check H6b against H6w from this line alone,
+    // with no join to any other file.
+    const Eigen::Quaterniond Tq(this->degen_T_prev_.block<3,3>(0,0).cast<double>());
+    const Eigen::Vector3d    Tp = this->degen_T_prev_.block<3,1>(0,3).cast<double>();
     std::lock_guard<std::mutex> print_lock(this->print_mutex_);
     // The new fields are APPENDED, never inserted: every parser written against
     // the first three runs' logs (proof_data/analyse_run.py, aa/fine.py) matches
@@ -1523,11 +1614,49 @@ void dlio::OdomNode::logDegeneracy() {
            "kfage=%.2f kfn=%ld kfmax=%.2f kfmin=%.3f "
            "abmax=%.4f,%.4f,%.4f abmrg=%.4f "
            "rvalid=%d rlam=%.6g %.6g %.6g rr=%.6f ru_min=(%.4f,%.4f,%.4f) cond6=%.6g "
+           "hvalid=%d ncorr_raw=%d ferr=%.17g "
+           "Tq=%.17g,%.17g,%.17g,%.17g Tp=%.17g,%.17g,%.17g "
+           "H6w=%s H6b=%s dp6v=%d dp6=%s corr6=%s innov6=%s "
            "units=lam:corr_count;q:corr_count_per_corr;rm:m;innov:m;dp:m;"
            "imu_hz:Hz;imu_dtmax:s;smsz:keyframes;smkcc:indices;smref:lists;"
            "smdmax:m;smdkcc:m;kfage:s;kfn:keyframes;kfmax:s;kfmin:m;"
            "abmax:m_per_s2;abmrg:m_per_s2;rlam:corr_count_times_m2;rr:ratio;"
-           "cond6:MIXED_UNITS_relative_only\n",
+           "cond6:MIXED_UNITS_relative_only;"
+           // --- E2 ---------------------------------------------------------
+           // H6w / H6b are the SAME 6x6 in two charts. 21 = the free entries of
+           // a symmetric 6x6, packed ROW-MAJOR OVER THE UPPER TRIANGLE:
+           // (0,0)(0,1)..(0,5)(1,1)..(1,5)(2,2)..(2,5)(3,3)(3,4)(3,5)(4,4)(4,5)(5,5).
+           // Block order is [rot 0..2 | trans 3..5] in BOTH.
+           //   H6w  exactly what nano_gicp accumulated: a LEFT perturbation in
+           //        the WORLD frame with the rotation Jacobian taken about the
+           //        WORLD ORIGIN, so its rotation block carries the squared
+           //        distance from that origin. lam / rlam on this same line are
+           //        the eigenvalues of its (3,3) and (0,0) blocks -- which is
+           //        how a reader checks that this field is what it says it is.
+           //   H6b  the same information in gtsam::Pose3's RIGHT / BODY tangent
+           //        at the pose Tq/Tp: Ad(T)^T H6w Ad(T). The cross block
+           //        cancels the world-origin lever arm exactly, so H6b's
+           //        rotation block is SENSOR-anchored -- the attitude
+           //        information of the scene, not of where the scene sits
+           //        relative to (0,0,0).
+           // Both are correspondence counts, not informations in m^-2: PLANE
+           // regularisation forces every point covariance to (1,1,1e-3) and the
+           // scalar that converts them is fitted offline, never here.
+           // The three 6-vectors share ONE chart, the DECOUPLED
+           // [rotvec(3) rad ; translation(3) m]: v = (log_SO3(R_A^T R_B),
+           // R_A^T (t_B - t_A)) for a relative pose A^-1 B. Rebuild it exactly
+           // with Pose3(Rot3::Expmap(v[0:3]), v[3:6]). It is NOT gtsam's
+           // Pose3::Logmap, which carries V(omega)^-1 on the translation half.
+           "H6w:UPPER21_ROWMAJOR_rot0to2_trans3to5_WORLD_LEFT_ORIGIN_ANCHORED;"
+           "H6b:UPPER21_ROWMAJOR_rot0to2_trans3to5_BODY_RIGHT_SENSOR_ANCHORED;"
+           "H6blocks:rot_rot:corr_count_times_m2,rot_trans:corr_count_times_m,"
+           "trans_trans:corr_count;"
+           "Tq:quaternion_wxyz_world_from_body;Tp:m;"
+           "dp6:DECOUPLED_rotvec_rad_then_m,prev_GICP_pose_to_this_GICP_pose;"
+           "corr6:DECOUPLED_rotvec_rad_then_m,T_prior_to_T_gicp;"
+           "innov6:DECOUPLED_rotvec_rad_then_m,state_to_lidarPose;"
+           "ferr:sum_mahalanobis_sq_error_at_accepted_LM_step;"
+           "ncorr_raw:corr_count_UNGATED\n",
            this->scan_stamp, (int)W.valid, W.ncorr,
            W.lambda(0), W.lambda(1), W.lambda(2),
            W.ratio(0), W.ratio(1), W.ratio(2),
@@ -1555,8 +1684,31 @@ void dlio::OdomNode::logDegeneracy() {
            this->degen_rot_.lambda(0), this->degen_rot_.lambda(1),
            this->degen_rot_.lambda(2), this->degen_rot_.ratio_min(),
            this->degen_rot_.u_min(0), this->degen_rot_.u_min(1),
-           this->degen_rot_.u_min(2), this->degen_rot_.cond6);
+           this->degen_rot_.u_min(2), this->degen_rot_.cond6,
+           (int)this->degen_h_.valid, this->degen_h_.ncorr, this->degen_h_.ferr,
+           Tq.w(), Tq.x(), Tq.y(), Tq.z(), Tp(0), Tp(1), Tp(2),
+           h6w, h6b, dp6_valid, dp6, corr6, innov6);
     fflush(stdout);
+    if (this->degen_h_.valid) ++this->degen_h6_written_;
+  }
+
+  // SILENT NO-OP LAW for the E2 record itself. COMPUTED = scans scored;
+  // APPLIED = lines that actually carried a 6x6. The way this instrument fails
+  // silently is not a wrong number, it is hvalid=0 on every line -- an
+  // unconverged LM leaves no fresh Hessian and hessian_record() refuses, so a
+  // run can score 11,000 scans and dump nothing while every other column looks
+  // healthy. That is indistinguishable from a working dump until somebody tries
+  // to fit on it, which is a 40-minute bag replay too late.
+  if (!this->degen_h6_noop_reported_ && this->degen_scans_ > 1000 &&
+      this->degen_h6_written_ == 0) {
+    this->degen_h6_noop_reported_ = true;
+    fprintf(stderr,
+            "[DEGEN][ERROR] %ld scans scored and NOT ONE carried a 6x6 "
+            "(hvalid=0 on every line). getFinalHessian() is never fresh: check "
+            "that nano_gicp's LM is accepting steps (hasFinalHessian()), and do "
+            "not fit anything on this run.\n",
+            (long)this->degen_scans_.load());
+    fflush(stderr);
   }
 
   // SILENT NO-OP LAW, both directions.
@@ -1928,6 +2080,17 @@ void dlio::OdomNode::updateState() {
   // had to infer it from exported pose steps because the banner's Position {W}
   // is the same series as the exported pose, not the disagreement.
   this->degen_innov_ = (double)err.norm();
+
+  // E2: the SAME innovation as a 6-VECTOR, so the rotational half stops being
+  // invisible. |err| is a translation norm; the onset of this bag's divergence
+  // is a heading error, and a translation-only instrument is structurally blind
+  // to it (the reason the rotation block was added at all). Chart: rotation
+  // vector of qhat^-1 qin, then (pin - state.p) rotated into the STATE frame --
+  // the same decoupled [rotvec ; translation] chart every other 6-vector on the
+  // line uses. Recorded before the guard, like the scalar above.
+  this->degen_innov6_ = dlio::degeneracy::relative_rot_trans(
+      qhat.toRotationMatrix().cast<double>(), this->state.p.cast<double>(),
+      qin.toRotationMatrix().cast<double>(), pin.cast<double>());
 
   // --- GICP degeneracy guard ------------------------------------------------
   // Along a direction the scan cannot measure, `err` is not evidence: it is the
