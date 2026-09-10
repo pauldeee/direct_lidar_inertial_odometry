@@ -15,6 +15,7 @@
 #include "dlio/imu_delivery.h"
 #include "dlio/repairs.h"
 #include "dlio/resume.h"
+#include "dlio/smoother.h"
 #include <ros/callback_queue.h>
 #include <ros/subscribe_options.h>
 #include <memory>
@@ -58,6 +59,10 @@ private:
   void getNextPose();
   void scoreDegeneracy();   // score this scan's GICP geometry; see dlio/degeneracy.h
   void logDegeneracy();     // report it AFTER updateState, so `removed` is THIS scan's
+  // --- E4 / ARCHITECT A: the nudge. See dlio/smoother.h for the whole design.
+  void smootherUpdate();       // solve, then the SIX writes, at odom.cc's :1256
+  void logSmoother();          // the [SMOOTH] record, one line per scan
+  void applyKeyframeDeltas();  // in buildKeyframesAndSubmap, BEFORE buildSubmap
   bool imuMeasFromTimeRange(double start_time, double end_time,
                             boost::circular_buffer<ImuMeas>::reverse_iterator& begin_imu_it,
                             boost::circular_buffer<ImuMeas>::reverse_iterator& end_imu_it);
@@ -256,6 +261,25 @@ private:
   boost::circular_buffer<ImuMeas> imu_buffer;
   std::mutex mtx_imu;
   std::condition_variable cv_imu_stamp;
+
+  // --- E4: THE RAW IMU TAP ---------------------------------------------------
+  // `imu_buffer` above is BIAS-CORRECTED AT ARRIVAL with whatever bias was
+  // current (callbackImu), so it cannot be reused by an estimator that
+  // re-estimates bias; and it has been through transformImu(), which rotates
+  // into baselink and adds a lever-arm term built from a FINITE DIFFERENCE of
+  // omega at 640 Hz against a gyro whose own rms is 0.264 deg/s. gtsam's
+  // body_P_sensor does that job analytically and without differentiating noise.
+  // So the smoother gets its own tap: the RAW sensor-frame sample, taken at the
+  // top of callbackImu before anything touches it.
+  struct RawImu {
+    double stamp;
+    Eigen::Vector3d accel;   // m/s^2, SENSOR frame, no bias removed
+    Eigen::Vector3d gyro;    // rad/s, SENSOR frame, no bias removed
+  };
+  std::deque<RawImu> raw_imu_buffer_;
+  std::mutex mtx_raw_imu_;
+  double raw_imu_keep_s_;      // how far back the tap is kept (lag + margin)
+  std::atomic<long> raw_imu_n_;
 
   static bool comparatorImu(ImuMeas m1, ImuMeas m2) {
     return (m1.stamp < m2.stamp);
@@ -494,6 +518,49 @@ private:
   std::atomic<long>   degen_invalid_;        // scans refused (stale Hessian / too few corr.)
   bool degen_noop_reported_;                 // one-shot silent-no-op complaint (armed, nothing applied)
   bool degen_blind_reported_;                // one-shot complaint: armed, nothing ever SCORED degenerate
+
+  // --- E4 / ARCHITECT A -------------------------------------------------------
+  // The smoother, its ledger, and the plumbing that carries a smoothed keyframe
+  // pose from the lidar thread into the async submap builder. `enabled` is
+  // FALSE in the image: the recipe row turns it on, so the product path is
+  // untouched by the presence of this code.
+  dlio::smoother::Params smoother_params_;
+  std::unique_ptr<dlio::smoother::Smoother> smoother_;
+  dlio::smoother::Solution smoother_sol_;
+  dlio::smoother::WriteBackReport smoother_rep_;
+  dlio::smoother::NoOpLedger smoother_ledger_;
+  bool smoother_bias_seeded_;
+  bool smoother_noop_reported_;
+  long smoother_scans_;                      // scans handed to the smoother
+  std::vector<double> smoother_solve_ms_;    // the compute-budget series
+  double smoother_solve_ms_max_;
+
+  // KEYFRAME WRITE-BACK. The lidar thread queues a world->world delta per
+  // in-window keyframe; buildKeyframesAndSubmap() applies it to the cloud, the
+  // covariances and the stored transform BEFORE composing the submap, and the
+  // kd-tree is rebuilt lazily on the next align because the composition changed.
+  // FREEZE ON MARGINALISATION: once a keyframe's scan leaves the window it is
+  // frozen forever and queueDelta() REFUSES it -- counted, never silent.
+  std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> kf_pending_delta_;
+  std::vector<char> kf_has_delta_;
+  std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> kf_pose_now_;
+  std::vector<char> kf_frozen_;
+  std::mutex kf_delta_mutex_;
+  std::atomic<long> smoother_kf_applied_;
+  std::atomic<long> smoother_kf_refused_;
+  std::atomic<bool> smoother_submap_dirty_;
+
+  // The sink is a nested type so it can reach the vectors above without making
+  // any of them public. It holds a bare pointer to the node, which outlives it.
+  struct KfSink : public dlio::smoother::KeyframeSink {
+    explicit KfSink(dlio::OdomNode* n) : node(n) {}
+    bool queueDelta(int kf_index, const Eigen::Matrix4d& delta,
+                    const Eigen::Matrix4d& pose_new) override;
+    void markSubmapDirty() override;
+    bool poseOf(int kf_index, Eigen::Matrix4d* out) const override;
+    dlio::OdomNode* node;
+  };
+  std::unique_ptr<KfSink> kf_sink_;
 
   // stdout is one buffer. logDegeneracy() printf+fflush runs on the lidar
   // callback thread while debug() writes the status banner field by field with
