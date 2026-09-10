@@ -588,10 +588,23 @@ struct NoOpLedger {
   // that made this counter necessary printed `verdict OK` on a 1,329 km
   // trajectory and its bend window was scored as a PASS.
   long floored = 0;
+  // ... and the LONGEST unbroken run of them, against the number of poses the
+  // window actually holds (window_vars / 3 -- MEASURED from the solve, never
+  // assumed from lag_s and a scan rate). A streak longer than the window means
+  // every variable in the window is now inertial: there is no scan left in it
+  // that ever saw a correspondence.
+  long floored_streak = 0;
+  long floored_streak_max = 0;
+  long window_poses = 0;
 
   void note(const Solution& sol, const WriteBackReport& rep) {
     ++scans;
     if (sol.solved_this_scan) ++solved;
+    if (sol.solved_this_scan) {
+      window_poses = sol.window_vars / 3;
+      floored_streak = sol.floor_binding ? floored_streak + 1 : 0;
+      floored_streak_max = std::max(floored_streak_max, floored_streak);
+    }
     if (sol.solved_this_scan && sol.floor_binding) ++floored;
     if (sol.update_exception) ++exceptions;
     reseats = std::max(reseats, sol.reseats);
@@ -648,6 +661,23 @@ struct NoOpLedger {
     // its bias with the IMU factor, so such a run scores near zero BY
     // CONSTRUCTION.  [[silent_no_op_law]]
 #if DLIO_SMOOTHER_SABOTAGE != 6
+    // (i) the streak. This is the one that fires in TIME to matter: on the E4
+    //     bench it trips at bag t 295.7 -- 44 s BEFORE the bend window opens --
+    //     where the cumulative majority does not trip until t 565.6, long after
+    //     the number it invalidates has been read. The comparison is against
+    //     the window's OWN pose count, so there is no new constant here.
+    if (window_poses > 0 && floored_streak_max > window_poses)
+      return "the registration information was the CONSTANT FLOOR on " +
+             std::to_string(floored_streak_max) +
+             " CONSECUTIVE solved scans, against a window that holds " +
+             std::to_string(window_poses) +
+             " poses. Every variable in the window is inertial: not one scan "
+             "left in it ever saw a correspondence. Any attitude, gravity or "
+             "bend number taken from this run is the IMU's own answer read "
+             "back by an arbiter that shares its gyro and its bias -- near "
+             "zero BY CONSTRUCTION. Look at ncorr in the [DEGEN] record.";
+    // (ii) and the run-level majority, for a run that loses the measurement in
+    //      bursts rather than in one block.
     if (solved > 0 && floored * 2 > solved)
       return "the registration information was the CONSTANT FLOOR on " +
              std::to_string(floored) + " of " + std::to_string(solved) +
