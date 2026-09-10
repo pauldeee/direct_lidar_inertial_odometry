@@ -13,6 +13,7 @@
 
 #include <Eigen/Core>
 #include <Eigen/Eigenvalues>
+#include <Eigen/Geometry>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -271,6 +272,197 @@ inline Eigen::Vector3f clamp_innovation(const Eigen::Vector3f& v, double max_m) 
   const double n = v.norm();
   if (!(n > max_m)) return v;
   return v * static_cast<float>(max_m / n);
+}
+
+
+// =========================================================================
+//  E2 — THE TRUE 6x6, RE-ANCHORED ON THE SENSOR
+//  keeper/lio_concept/dlio_smoother/E4/E2/E2.md
+//
+//  INSTRUMENTATION ONLY. Nothing below is read by the guard, by
+//  updateState(), or by any arithmetic on the trajectory. It exists because
+//  E0 could only reconstruct 5 of the 6 free parameters of each 3x3 diagonal
+//  block from the eigen-summaries this record already carries, and NONE of
+//  the rotation<->translation CROSS block -- and the cross block is exactly
+//  what re-anchors the rotation information from the WORLD ORIGIN onto the
+//  SENSOR. E0 measured the cost of not having it: the fitted attitude weight
+//  s_r differed 6.62x between the big bag and Dave, and 6.85 is the ratio of
+//  the squared distances from the world origin (E0.md section 3). That is a
+//  lever arm, not a scene.
+//
+//  THE FRAMES, stated once, because getting this wrong is silent.
+//
+//  nano_gicp perturbs on the LEFT, in the WORLD frame, with a DECOUPLED
+//  parameterisation (src/nano_gicp/lsq_registration.cc step_lm:
+//      delta.linear() = so3_exp(d.head<3>());  delta.translation() = d.tail<3>();
+//      x0 = delta * x0)
+//  and the residual Jacobian is built from the point's WORLD coordinate
+//  (src/nano_gicp/nano_gicp.cc: dtdx0.block<3,3>(0,0) = skewd(transed_mean_A),
+//  dtdx0.block<3,3>(0,3) = -I). So
+//
+//      H_world = sum_i J_i^T M_i J_i,   J_i = [ skew(y_i) , -I ],   y_i in WORLD
+//
+//  is the information about xi_w = [omega_w ; tau_w] -- a rotation about the
+//  WORLD ORIGIN and a world translation. Block order [rot(0..2) | trans(3..5)].
+//
+//  GTSAM's Pose3 retracts on the RIGHT, in the BODY frame, with the SAME
+//  [rot | trans] block order: X <- X * Exp(xi_b). To first order the two
+//  charts are related by the adjoint,
+//
+//      xi_w = Ad(T) xi_b,     Ad(T) = [[ R , 0 ], [ skew(t) R , R ]]
+//
+//  (gtsam::Pose3::AdjointMap, same ordering), hence
+//
+//      LAMBDA_body = Ad(T)^T H_world Ad(T).
+//
+//  AND THAT PRODUCT IS THE RE-ANCHORING. Writing y_i = t + r_i with r_i the
+//  point relative to the SENSOR, the rotation block of the product collapses
+//  algebraically to
+//
+//      LAMBDA_body(0:3,0:3) = R^T ( sum_i skew(r_i)^T M_i skew(r_i) ) R
+//
+//  -- the sensor-anchored attitude information, with every |t|^2 term gone.
+//  The cancellation consumes H_rt and H_tr, which is precisely why no
+//  eigen-summary of the two DIAGONAL blocks can do it and why E0 had to use
+//  rlam as a per-run scalar. test_degeneracy.cpp case 26 asserts the identity
+//  and case 27 asserts that the contamination it removes is the |t|^2 E0
+//  measured.
+//
+//  The translation block is UNMOVED by the re-anchoring and only rotated:
+//      LAMBDA_body(3:6,3:6) = R^T H_tt R
+//  which is what E0's PREREG section 2 already used, and case 26 pins it too.
+//
+//  FIRST-ORDER, and say so: nano_gicp's chart is decoupled (so3_exp on the
+//  rotation, a plain translation) and GTSAM's Exp is the SE(3) exponential.
+//  The two agree at xi = 0 and differ at second order, so this conversion is
+//  exact for a Hessian AT the linearisation point and nowhere else. Nobody
+//  should later "fix" it into a bug.
+// =========================================================================
+
+// skew(v), as a 3x3. Named because the SIGN convention is the thing that goes
+// silently wrong: this is the one for which skew(a) b == a.cross(b).
+inline Eigen::Matrix3d skew3(const Eigen::Vector3d& v) {
+  Eigen::Matrix3d S;
+  S <<     0.0, -v(2),  v(1),
+         v(2),    0.0, -v(0),
+        -v(1),  v(0),    0.0;
+  return S;
+}
+
+// Ad(T) for T = (R, t), in [rot(0..2) | trans(3..5)] order -- the ordering
+// nano_gicp and gtsam::Pose3 happen to share. Maps a RIGHT/BODY twist to the
+// LEFT/WORLD twist that produces the same motion of the rigid body.
+inline Eigen::Matrix<double, 6, 6> adjoint_rot_trans(const Eigen::Matrix3d& R,
+                                                     const Eigen::Vector3d& t) {
+  Eigen::Matrix<double, 6, 6> A = Eigen::Matrix<double, 6, 6>::Zero();
+  A.block<3, 3>(0, 0) = R;
+  A.block<3, 3>(3, 0) = skew3(t) * R;
+  A.block<3, 3>(3, 3) = R;
+  return A;
+}
+
+// H_world (left/world, origin-anchored) -> Lambda_body (right/body,
+// sensor-anchored). Symmetrised on the way out: H is a sum of J^T M J and is
+// symmetric to round-off, and a factor information matrix that is not exactly
+// symmetric is a source of asymmetric bugs downstream.
+inline Eigen::Matrix<double, 6, 6> body_information(const Eigen::Matrix<double, 6, 6>& H,
+                                                    const Eigen::Matrix3d& R,
+                                                    const Eigen::Vector3d& t) {
+  const Eigen::Matrix<double, 6, 6> A = adjoint_rot_trans(R, t);
+  Eigen::Matrix<double, 6, 6> L = A.transpose() * H * A;
+  return 0.5 * (L + L.transpose());
+}
+
+// The 21 free entries of a symmetric 6x6, ROW-MAJOR over the UPPER triangle:
+//   (0,0)(0,1)...(0,5) (1,1)...(1,5) (2,2)...(2,5) (3,3)(3,4)(3,5) (4,4)(4,5) (5,5)
+// One order, written down once, used by the printf and by the reader.
+inline void upper21(const Eigen::Matrix<double, 6, 6>& M, double out[21]) {
+  int k = 0;
+  for (int i = 0; i < 6; ++i)
+    for (int j = i; j < 6; ++j) out[k++] = M(i, j);
+}
+
+// The inverse of upper21 -- so a test can round-trip and a reader has one
+// authority for the order rather than two transcriptions of it.
+inline Eigen::Matrix<double, 6, 6> from_upper21(const double in[21]) {
+  Eigen::Matrix<double, 6, 6> M;
+  int k = 0;
+  for (int i = 0; i < 6; ++i)
+    for (int j = i; j < 6; ++j) { M(i, j) = in[k]; M(j, i) = in[k]; ++k; }
+  return M;
+}
+
+// SO(3) log: the rotation VECTOR (axis * angle, radians) of R.
+//
+// Via the QUATERNION, not via acos((tr-1)/2), and the reason is measured. The
+// trace route is ill-conditioned in a window around pi far wider than it looks:
+// at theta = pi - 2.7e-6 it returns |w| = 3.1416034 for a true 3.14159, an
+// error of 1.3e-5 rad, because the scale factor 0.5*theta/sin(theta) inherits
+// the relative error of a theta recovered from a trace that has gone flat.
+// Eigen's matrix-to-quaternion picks its branch from the largest diagonal term
+// and stays conditioned everywhere, and atan2(|v|, w) is conditioned at both
+// ends. Round-trips to 1e-13 or better from 1e-9 rad to pi.
+inline Eigen::Vector3d log_so3(const Eigen::Matrix3d& R) {
+  Eigen::Quaterniond q(R);
+  q.normalize();
+  if (q.w() < 0.0) q.coeffs() *= -1.0;      // shortest path: theta in [0, pi]
+  const double n = q.vec().norm();
+  if (n < 1e-12) {                           // theta -> 0
+    if (q.w() == 0.0) return Eigen::Vector3d::Zero();
+    return Eigen::Vector3d((2.0 / q.w()) * q.vec());
+  }
+  return Eigen::Vector3d((2.0 * std::atan2(n, q.w()) / n) * q.vec());
+}
+
+// The DECOUPLED relative-pose 6-vector, [rotvec(3) ; translation(3)], for a
+// relative pose A^-1 B:
+//     v(0:3) = log_so3( R_A^T R_B )              radians
+//     v(3:6) = R_A^T ( t_B - t_A )               metres, in A's own frame
+// Rebuild EXACTLY with gtsam.Pose3(gtsam.Rot3.Expmap(v[0:3]), v[3:6]).
+// This is NOT gtsam's Pose3::Logmap, which puts V(omega)^-1 on the
+// translation; the decoupled form is chosen because it is invertible offline
+// with no extra machinery and because reading it needs no convention lookup.
+inline Eigen::Matrix<double, 6, 1> relative_rot_trans(const Eigen::Matrix3d& RA,
+                                                      const Eigen::Vector3d& tA,
+                                                      const Eigen::Matrix3d& RB,
+                                                      const Eigen::Vector3d& tB) {
+  Eigen::Matrix<double, 6, 1> v;
+  v.head<3>() = log_so3(RA.transpose() * RB);
+  v.tail<3>() = RA.transpose() * (tB - tA);
+  return v;
+}
+
+// One scan's E2 record. Everything here is derived from the SAME
+// getFinalHessian() the two eigen-summary blocks are derived from, at the same
+// linearisation point, so a disagreement between them is a bug and a reader
+// can check for one.
+struct HessianRecord {
+  bool valid = false;
+  double Hw[21] = {0};      // WORLD/LEFT, origin-anchored -- as nano_gicp built it
+  double Hb[21] = {0};      // BODY/RIGHT, sensor-anchored -- Ad^T H Ad
+  double ferr = 0.0;        // getFinalError(): sum e^T M e at the accepted step
+  int    ncorr = 0;         // gicp.num_correspondences, UNGATED
+};
+
+inline HessianRecord hessian_record(const Eigen::Matrix<double, 6, 6>& H,
+                                    bool hessian_valid,
+                                    const Eigen::Matrix3d& R,
+                                    const Eigen::Vector3d& t,
+                                    double final_error, int ncorr) {
+  HessianRecord Q;
+  Q.ferr = final_error;
+  Q.ncorr = ncorr;
+  // Same refusal as the two scorers, for the same reason: final_hessian_ is
+  // only written on an ACCEPTED LM step, so an unconverged scan still holds the
+  // PREVIOUS scan's geometry and dumping it would put one scan's matrix on
+  // another scan's line.
+  if (!hessian_valid || !H.allFinite()) return Q;
+  const Eigen::Matrix<double, 6, 6> L = body_information(H, R, t);
+  if (!L.allFinite()) return Q;
+  upper21(H, Q.Hw);
+  upper21(L, Q.Hb);
+  Q.valid = true;
+  return Q;
 }
 
 }  // namespace degeneracy
