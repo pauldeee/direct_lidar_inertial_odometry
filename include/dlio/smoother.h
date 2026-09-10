@@ -220,6 +220,16 @@ struct Params {
   int    lm_max_iterations = 20;
   double lm_relative_error_tol = 1e-8;
 
+  // The linear solver inside the fixed-lag LM. MULTIFRONTAL_CHOLESKY, which is
+  // what e0_solve.py and e2_solve.py use -- the offline A/A compares a
+  // trajectory, and a different factorisation is a difference this code would
+  // have introduced. "MULTIFRONTAL_QR" is reachable and measured beside it
+  // (IMPL.md sec 7): it is ~5x slower and, once the information matrices are
+  // right, buys nothing. It bought a great deal while they were WRONG, which is
+  // how the zero-information bug of IMPL.md sec 6.3 first showed itself --
+  // worth remembering the next time a solver change looks like a fix.
+  std::string linear_solver = "MULTIFRONTAL_CHOLESKY";
+
   // --- compute budget lever (IMPL.md sec 7). 1 = solve every scan. N > 1
   // accumulates N scans of factors and calls update() once, which is still a
   // fixed lag; the write-back then applies on the scans that solved. Measured
@@ -304,6 +314,11 @@ struct Solution {
   bool   floor_binding = false;
   bool   psd_projected = false;
   bool   update_exception = false;
+  long   singular_info = 0;    // cumulative: registration factors REFUSED
+                               // because their information was singular
+  long   reseats = 0;          // cumulative: a fixed-lag window rebuilt from
+                               // scratch after a failed update. Bounded and
+                               // COUNTED; a run with any is not a clean arm.
   bool   solved_this_scan = false;   // false on the scans marginalize_every skips
 };
 
@@ -565,11 +580,13 @@ struct NoOpLedger {
   long kf_written = 0;
   long kf_frozen_refused = 0;
   long exceptions = 0;
+  long reseats = 0;
 
   void note(const Solution& sol, const WriteBackReport& rep) {
     ++scans;
     if (sol.solved_this_scan) ++solved;
     if (sol.update_exception) ++exceptions;
+    reseats = std::max(reseats, sol.reseats);
     if (sol.valid && rep.corr_m > 0.001) ++computed;
     if (rep.applied && (rep.applied_m > 0.0 || rep.applied_deg > 0.0)) ++applied;
     kf_written += rep.kf_written;
@@ -579,6 +596,14 @@ struct NoOpLedger {
   // "" when healthy; otherwise the message to put on stderr, once.
   std::string violation(double alpha, long min_scans = 500) const {
     if (scans < min_scans) return std::string();
+    if (reseats > 0)
+      return "the fixed-lag window was RE-SEATED " + std::to_string(reseats) +
+             " time(s) after a failed update. The solve went indeterminant, the "
+             "window's accumulated information was thrown away and the chain "
+             "restarted. Look at dlio/smoother/linear_solver: on this bag "
+             "MULTIFRONTAL_CHOLESKY squares a conditioning of ~4e7 into the "
+             "normal equations and fails on healthy data, MULTIFRONTAL_QR does "
+             "not. This run is not a clean arm.";
     if (solved == 0)
       return "the smoother was ENABLED for " + std::to_string(scans) +
              " scans and NEVER SOLVED: no window ever formed. Check that "
