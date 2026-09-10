@@ -92,7 +92,7 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
            "info_scale_rot=%.9g info_scale_trans=%.9g huber_k=%.3f "
            "floor=(%.3g deg, %.3g m) marginalize_every=%d kf_writeback=%d "
            "reanchor=%d anchor_in_graph=%d anchor=(%.4g m, %.4g deg) "
-           "blend_increment=%d\n",
+           "blend_increment=%d writeback_bias=%d\n",
            this->smoother_->versionString().c_str(),
            this->smoother_params_.lag_s, this->smoother_params_.alpha,
            this->smoother_params_.info_scale_rot,
@@ -105,7 +105,8 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
            (int)this->smoother_params_.anchor_in_graph,
            this->smoother_params_.anchor_sigma_pos_m,
            this->smoother_params_.anchor_sigma_rot_deg,
-           (int)this->smoother_params_.blend_increment);
+           (int)this->smoother_params_.blend_increment,
+           (int)this->smoother_params_.writeback_bias);
     // The raw tap feeds gtsam the sample as it arrived; imu_accel_sm_ is DLIO's
     // accelerometer scale-misalignment matrix and it is applied to the buffered
     // copy only. Identity is the shipped value and the only one this tap is
@@ -639,6 +640,10 @@ void dlio::OdomNode::getParams() {
                               S.blend_increment, false);
     ros::param::param<double>("~dlio/smoother/standing_offset_max_m",
                               S.standing_offset_max_m, 0.002);
+    // E4 INCREMENT 3 candidate A. TRUE in the image so :smoother-2's arms stay
+    // reproducible from this tree; the trial row turns it off. See smoother.h.
+    ros::param::param<bool>  ("~dlio/smoother/writeback_bias",
+                              S.writeback_bias, true);
     ros::param::param<double>("~dlio/smoother/v0_sigma", S.v0_sigma, 0.5);
     ros::param::param<double>("~dlio/smoother/bias_prior_sigma_accel",
                               S.bias_prior_sigma_accel, 0.05);
@@ -2412,6 +2417,7 @@ void dlio::OdomNode::smootherUpdate() {
     t.kf_dirty_trans_m = this->smoother_params_.kf_dirty_trans_m;
     t.kf_dirty_rot_deg = this->smoother_params_.kf_dirty_rot_deg;
     t.R_bl_imu      = this->extrinsics.baselink2imu.R;
+    t.write_bias    = this->smoother_params_.writeback_bias;
     this->smoother_rep_ = dlio::smoother::write_back(
         t, this->smoother_sol_, this->smoother_params_.alpha,
         this->smoother_params_.blend_increment);
@@ -2448,7 +2454,7 @@ void dlio::OdomNode::logSmoother() {
            "s_rot=%.9g s_trans=%.9g "
            "n=%ld computed=%ld applied=%ld kf_applied=%ld kf_refused=%ld "
            "tgt_m=%.6f tgt_deg=%.6f anch_k=%ld anch_m=%.6f anch_deg=%.6f "
-           "imu_lead=%.3f imu_dry=%ld "
+           "imu_lead=%.3f imu_dry=%ld groups_exp=%d wbbias=%d "
            "reanch=%d incmode=%d standing=%ld measured=%ld "
            "units=solve_ms:ms;corr_m:m;corr_deg:deg;app_m:m;app_deg:deg;"
            "mcov:VARIANCE_diag_of_the_marginal_on_X_k_in_gtsam_Pose3_tangent_"
@@ -2456,7 +2462,7 @@ void dlio::OdomNode::logSmoother() {
            "r_reg:whitened_factor_error_BetweenPose3_after_Huber;"
            "s_rot:rad^-2_per_corr_count_times_m2;s_trans:m^-2_per_corr_count;"
            "win_vars:variables_in_the_fixed_lag_window;win_fac:factors;"
-           "groups:WRITE_GROUPS_of_6_T_lidarPose_state_geoprev_bias_keyframes;"
+           "groups:WRITE_GROUPS_of_groups_exp_T_lidarPose_state_geoprev_bias_keyframes_SIX_normally_FIVE_when_writeback_bias_is_off;"
            "kfw:in_window_keyframes_moved_THIS_scan;"
            "kffz:keyframes_that_LEFT_the_window_THIS_scan;"
            "reseats:fixed_lag_windows_REBUILT_after_a_failed_update_"
@@ -2489,7 +2495,8 @@ void dlio::OdomNode::logSmoother() {
            this->smoother_ledger_.applied,
            (long)this->smoother_kf_applied_, (long)this->smoother_kf_refused_,
            W.target_m, W.target_deg, (long)S.anchor_key, S.anchor_resid_m,
-           S.anchor_resid_deg, S.imu_lead_s, this->smoother_ledger_.imu_dry, (int)this->smoother_params_.reanchor,
+           S.anchor_resid_deg, S.imu_lead_s, this->smoother_ledger_.imu_dry,
+           W.groups_expected, (int)this->smoother_params_.writeback_bias, (int)this->smoother_params_.reanchor,
            (int)this->smoother_params_.blend_increment,
            this->smoother_ledger_.standing, this->smoother_ledger_.measured);
     fflush(stdout);

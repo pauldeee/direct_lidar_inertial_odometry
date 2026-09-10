@@ -274,6 +274,33 @@ struct Params {
   // it does not, and the registration was present, are counted; the majority
   // of them is the defect above. PROOF.md sec 7's own fixture threshold.
   double standing_offset_max_m = 0.002;
+
+  // --- E4 INCREMENT 3, CANDIDATE A: DO NOT HAND THE BIAS BACK -------------
+  //
+  // TRUE in the image, so :smoother-2 stays reproducible from this tree; the
+  // trial row turns it off. WHY IT EXISTS, measured on Dave cheese at
+  // alpha = 0.5 with the frame defect already fixed (E4/INC2/INC2.md sec 8):
+  // the write-back injects a slow ROLL/PITCH drift that grows monotonically
+  // through the run -- TILT p50 4.22 deg against a 0.35 deg noise floor,
+  // 1.71 -> 3.77 -> 4.48 -> 7.76 by quarter, 9.50 deg at the end -- while YAW,
+  // the direction gravity cannot see, wanders and returns. It is not the
+  // applied rotations adding up: their magnitudes sum to 393.8 deg for a
+  // 9.5 deg net effect. What DOES move with it is the accelerometer bias,
+  // which walks 64 % further than the alpha = 0 control's and puts the whole
+  // of that extra walk in ONE HORIZONTAL AXIS (y: -0.029 -> +0.096, a
+  // 0.125 m/s^2 swing = 0.73 deg of equivalent tilt before DLIO's own
+  // Kab = 0.25 loop acts on it at all). A horizontal specific-force bias and a
+  // tilt of the gravity vector are THE SAME OBSERVATION to the filter, and
+  // E4/REVIEW.md sec 8 had already named the shape: two bias mechanisms
+  // pulling against each other, DLIO's clamped loop against the graph's
+  // unclamped random walk, with the sixth write group handing the graph's
+  // answer to the loop ten times a second.
+  //
+  // Turning it off does NOT stop the smoother estimating the bias: the bias
+  // stays in the window, inside the CombinedImuFactor, which is what makes the
+  // increments good. It stops it being handed to a filter that already has its
+  // own loop for the same quantity.
+  bool   writeback_bias = true;
   double v0_sigma            = 0.5;    // m/s
   double bias_prior_sigma_accel = 0.05;   // m/s^2   -- a seed, not an assertion
   double bias_prior_sigma_gyro  = 0.005;  // rad/s
@@ -521,6 +548,12 @@ struct WriteTargets {
   double kf_dirty_trans_m = 0.005;
   double kf_dirty_rot_deg = 0.05;
   Eigen::Matrix3f     R_bl_imu = Eigen::Matrix3f::Identity();  // baselink <- imu
+  // E4 INCREMENT 3 candidate A. FALSE removes write group 5 and ONLY group 5;
+  // the report then EXPECTS five groups instead of six, so a missing sixth is
+  // still a hard error and a written fifth is a hard error too. A flag that
+  // made "5 of 6" acceptable would have disarmed the law it is standing next
+  // to ([[silent_no_op_law]]).
+  bool                write_bias = true;
 };
 
 struct WriteBackReport {
@@ -543,8 +576,12 @@ struct WriteBackReport {
   double applied_m = 0.0, applied_deg = 0.0;   // what alpha actually moved
   int    kf_written = 0;
   int    kf_frozen_refused = 0;
-  int    groups_written = 0;                   // MUST be 6 when applied
+  int    groups_written = 0;                   // MUST equal groups_expected
+  // 6 normally, 5 when the bias write-back is off. The law compares the two
+  // rather than a constant, so switching a group off cannot switch the law off.
+  int    groups_expected = 6;
   bool   increment_mode = false;               // (a) was used, not (b)
+  bool   bias_written = false;                 // group 5 actually ran
 };
 
 // b_baselink = R_bl_imu * b_sensor. R is proved against /ouster/metadata to
@@ -673,12 +710,19 @@ inline WriteBackReport write_back(const WriteTargets& t, const Solution& sol,
   //     them in. No clamp is applied here: a random-walk prior at the measured
   //     Allan floor has no rail to pin against, which is the whole reason
   //     mechanism M-E stops being an amplifier.
-  if (t.b_accel_bl && t.b_gyro_bl) {
+#if DLIO_SMOOTHER_SABOTAGE == 11
+  const bool do_bias = true;      // the flag is ignored: group 5 runs anyway
+#else
+  const bool do_bias = t.write_bias;
+#endif
+  rep.groups_expected = do_bias ? 6 : 5;
+  if (do_bias && t.b_accel_bl && t.b_gyro_bl) {
     const Eigen::Vector3f ba = bias_bl_from_sensor(t.R_bl_imu, sol.b_accel);
     const Eigen::Vector3f bg = bias_bl_from_sensor(t.R_bl_imu, sol.b_gyro);
     *t.b_accel_bl = (1.0f - (float)alpha) * *t.b_accel_bl + (float)alpha * ba;
     *t.b_gyro_bl  = (1.0f - (float)alpha) * *t.b_gyro_bl  + (float)alpha * bg;
     ++rep.groups_written;
+    rep.bias_written = true;
   }
 
   // (6) the in-window keyframes and the submap dirty flag. Without this the
@@ -760,6 +804,13 @@ struct NoOpLedger {
   // single step at the nearest sample it has, which is declared behaviour for
   // one scan and a broken IMU chain for a hundred.
   long imu_dry = 0;
+  // E4 INCREMENT 3: applied scans whose write ran a DIFFERENT number of groups
+  // than the configuration expects -- five when six were due, or six when the
+  // bias write-back is off. Both directions, because a flag that silently kept
+  // writing would be the same defect as one that silently stopped.
+  long groups_mismatch = 0;
+  long groups_seen = 0;
+  long groups_due = 0;
 
   void note(const Solution& sol, const WriteBackReport& rep) {
     ++scans;
@@ -780,6 +831,11 @@ struct NoOpLedger {
     reseats = std::max(reseats, sol.reseats);
     if (sol.valid && rep.corr_m > 0.001) ++computed;
     if (rep.applied && (rep.applied_m > 0.0 || rep.applied_deg > 0.0)) ++applied;
+    if (rep.applied) {
+      groups_seen = rep.groups_written;
+      groups_due = rep.groups_expected;
+      if (rep.groups_written != rep.groups_expected) ++groups_mismatch;
+    }
     kf_written += rep.kf_written;
     kf_frozen_refused += rep.kf_frozen_refused;
   }
@@ -868,6 +924,19 @@ struct NoOpLedger {
 #endif
       return std::string();
     }
+#if DLIO_SMOOTHER_SABOTAGE != 12
+    if (groups_mismatch > 0)
+      return "the write ran " + std::to_string(groups_seen) + " of the " +
+             std::to_string(groups_due) +
+             " write groups this configuration expects, on " +
+             std::to_string(groups_mismatch) +
+             " applied scan(s). Six are due normally and FIVE when "
+             "dlio/smoother/writeback_bias is off -- the law compares the two, "
+             "so switching a group off cannot switch the law off. A missing "
+             "group means the correction reaches the state and not the thing "
+             "the registration is measured AGAINST, and survives exactly one "
+             "scan.";
+#endif
     if (computed > 0 && applied == 0)
       return "the smoother computed a correction on " + std::to_string(computed) +
              " scans and the state NEVER MOVED (applied = 0). The nudge is a "
