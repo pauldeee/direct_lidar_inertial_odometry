@@ -581,10 +581,18 @@ struct NoOpLedger {
   long kf_frozen_refused = 0;
   long exceptions = 0;
   long reseats = 0;
+  // E4-REVIEW: scans on which the registration information was the CONSTANT
+  // FLOOR -- no correspondences, or a Hessian the solve refused. On those scans
+  // the graph holds an IMU chain and a 30 deg / 10 m prior and nothing else, so
+  // the pose it produces IS the gyro's own answer. Counted, because the run
+  // that made this counter necessary printed `verdict OK` on a 1,329 km
+  // trajectory and its bend window was scored as a PASS.
+  long floored = 0;
 
   void note(const Solution& sol, const WriteBackReport& rep) {
     ++scans;
     if (sol.solved_this_scan) ++solved;
+    if (sol.solved_this_scan && sol.floor_binding) ++floored;
     if (sol.update_exception) ++exceptions;
     reseats = std::max(reseats, sol.reseats);
     if (sol.valid && rep.corr_m > 0.001) ++computed;
@@ -626,6 +634,32 @@ struct NoOpLedger {
              " scans and the state NEVER MOVED (applied = 0). The nudge is a "
              "no-op: check alpha, and check that write_back() reached lidarPose "
              "and geo.prev_vel and not only state.";
+    // E4-REVIEW, the law's SECOND clause. The first clause asks whether the
+    // write HAPPENED. It does not ask whether there was anything to write it
+    // from -- and that is not a hypothetical: on the E4 bench of big Sandland
+    // the registration information was the constant floor on 3,132 of 5,947
+    // solved scans (100 % of them inside the bend window that was then scored
+    // as a PASS), the correspondence count reaching the graph was ZERO from
+    // bag t 276, and the ledger still said verdict=OK on a trajectory 1,329 km
+    // long. A majority is not a fitted band: when more than half the solved
+    // scans carry no registration at all, the arm is inertial dead reckoning
+    // with a smoother attached, and NO attitude or gravity number taken from it
+    // is evidence about the arbitration -- the gyro arbiter shares its gyro and
+    // its bias with the IMU factor, so such a run scores near zero BY
+    // CONSTRUCTION.  [[silent_no_op_law]]
+#if DLIO_SMOOTHER_SABOTAGE != 6
+    if (solved > 0 && floored * 2 > solved)
+      return "the registration information was the CONSTANT FLOOR on " +
+             std::to_string(floored) + " of " + std::to_string(solved) +
+             " solved scans -- the MAJORITY. On those scans the graph held an "
+             "IMU chain and a 30 deg / 10 m prior and no registration at all, "
+             "so this arm is inertial dead reckoning and the gyro arbiter, "
+             "which shares its gyro and its bias with that same IMU factor, "
+             "scores it near zero BY CONSTRUCTION. No attitude, gravity or "
+             "bend number from this run is evidence about the arbitration. "
+             "Look at ncorr in the [DEGEN] record: a stock draw of this bag "
+             "keeps 4,500-8,000 correspondences through the same windows.";
+#endif
     return std::string();
   }
 };

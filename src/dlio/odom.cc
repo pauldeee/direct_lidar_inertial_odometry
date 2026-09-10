@@ -363,9 +363,10 @@ dlio::OdomNode::~OdomNode() {
     printf("[SMOOTH] SUMMARY scans=%ld solved=%ld computed=%ld applied=%ld "
            "exceptions=%ld reseats=%ld kf_applied=%ld kf_refused=%ld raw_imu=%ld "
            "solve_ms p50=%.3f p95=%.3f p99=%.3f max=%.3f mean=%.3f "
-           "budget_100ms_exceeded=%ld verdict=%s "
+           "budget_100ms_exceeded=%ld verdict=%s floored=%ld "
            "units=solve_ms:ms;budget:scans_whose_solve_exceeded_the_100_ms_"
-           "scan_period\n",
+           "scan_period;floored=solved_scans_whose_registration_information_"
+           "was_the_CONSTANT_FLOOR_a_majority_is_an_ERROR\n",
            this->smoother_ledger_.scans, this->smoother_ledger_.solved,
            this->smoother_ledger_.computed, this->smoother_ledger_.applied,
            this->smoother_ledger_.exceptions, this->smoother_ledger_.reseats,
@@ -374,7 +375,8 @@ dlio::OdomNode::~OdomNode() {
            q(0.50), q(0.95), q(0.99), v.back(), sum / (double)v.size(),
            (long)std::count_if(v.begin(), v.end(),
                                [](double x) { return x > 100.0; }),
-           viol.empty() ? "OK" : "SILENT-NO-OP");
+           viol.empty() ? "OK" : "SILENT-NO-OP",
+           this->smoother_ledger_.floored);
     fflush(stdout);
   }
 }
