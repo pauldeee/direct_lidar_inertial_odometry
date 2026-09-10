@@ -299,6 +299,8 @@ Solution Smoother::update(const ScanInput& in) {
     }
   }
 
+  if (!in.imu.empty()) out.imu_lead_s = in.imu.back().stamp - in.stamp;
+
   const gtsam::Pose3 Tg = pose_of(in.T_gicp);
   Eigen::Vector3d v_init = in.v_world;
   if (!v_init.allFinite()) v_init.setZero();

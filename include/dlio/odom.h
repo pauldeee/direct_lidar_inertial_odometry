@@ -278,7 +278,9 @@ private:
   };
   std::deque<RawImu> raw_imu_buffer_;
   std::mutex mtx_raw_imu_;
-  double raw_imu_keep_s_;      // how far back the tap is kept (lag + margin)
+  double raw_imu_keep_s_;      // how far back the tap is kept (the PIPELINE
+                               // backlog, not the window -- E4 increment 2)
+  double raw_imu_lead_s_;      // newest raw sample stamp minus this scan's
   std::atomic<long> raw_imu_n_;
 
   static bool comparatorImu(ImuMeas m1, ImuMeas m2) {

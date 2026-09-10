@@ -375,6 +375,11 @@ struct Solution {
   int    lm_iterations = 0;
   int    imu_samples = 0;
   int    imu_gaps = 0;
+  // HOW FAR THE IMU STREAM IS AHEAD OF THIS SCAN, in seconds: the newest raw
+  // sample the tap holds minus this scan's own stamp. It IS the pipeline
+  // backlog, and when it exceeds raw_imu_keep_s the tap runs dry -- so the
+  // record shows the horizon and not only the moment it was crossed.
+  double imu_lead_s = 0.0;
   bool   floor_binding = false;
   bool   psd_projected = false;
   bool   update_exception = false;
@@ -750,10 +755,16 @@ struct NoOpLedger {
   double standing_max_m = 0.002;
   // and how many scans were re-anchored, so a run can show the clause ran
   long anchored = 0;
+  // E4 INCREMENT 2, clause 4's counter: scans on which the RAW IMU TAP RAN DRY
+  // -- not one sample inside the scan interval. The smoother then integrates a
+  // single step at the nearest sample it has, which is declared behaviour for
+  // one scan and a broken IMU chain for a hundred.
+  long imu_dry = 0;
 
   void note(const Solution& sol, const WriteBackReport& rep) {
     ++scans;
     if (sol.anchor_added) ++anchored;
+    if (sol.solved_this_scan && sol.imu_samples == 0) ++imu_dry;
     if (sol.solved_this_scan && sol.valid && !sol.floor_binding) {
       ++measured;
       if (rep.corr_m > standing_max_m) ++standing;
@@ -789,6 +800,34 @@ struct NoOpLedger {
              " scans and NEVER SOLVED: no window ever formed. Check that "
              "dlio/smoother/enabled and lag_s reached the node (rosparam dump "
              "/robot/dlio_odom), not just the recipe row.";
+    // E4 INCREMENT 2, the law's FOURTH clause, and it is a BENCH the review will
+    // never see that made it necessary. `raw_imu_keep_s` sizes the tap against
+    // the WINDOW; what has to be covered is how far the SCAN pipeline is running
+    // behind the IMU stream, and on a contended box that is unbounded. On an
+    // increment-2 bench the solve reached 92 ms p50, DLIO fell more than 10 s
+    // behind the player, and the tap ran DRY on 31 % of Sandbar's scans -- while
+    // ncorr stayed at 20,000, so every registration column looked healthy. The
+    // CombinedImuFactor was then one step at the nearest sample, the window's
+    // velocity and attitude went wrong, the correction climbed 1.8 mm to 6 m in
+    // eleven scans, the fixed-lag update threw, and the arm read 9.7 km on a
+    // 27 m bag. Nothing in the trajectory said "the IMU tap ran dry"; the run
+    // looked exactly like an estimator failure and was not one.
+    // 1 % is not a fitted band: one dry scan is the declared fallback, a
+    // hundred is a different sensor.  [[silent_no_op_law]]
+#if DLIO_SMOOTHER_SABOTAGE != 10
+    if (solved > 0 && imu_dry * 100 > solved)
+      return "the RAW IMU TAP RAN DRY on " + std::to_string(imu_dry) + " of " +
+             std::to_string(solved) +
+             " solved scans -- not one sample inside the scan interval, so the "
+             "CombinedImuFactor was a SINGLE STEP at the nearest sample the "
+             "buffer still had. Every registration column will still look "
+             "healthy while the window's velocity and attitude go wrong. The "
+             "cause is the SCAN PIPELINE running further behind the IMU stream "
+             "than dlio/smoother/raw_imu_keep_s covers -- a starved box, a "
+             "contended bench, or a solve that no longer fits the scan period. "
+             "Look at imu_n on the [SMOOTH] line and at solve_ms. This run is "
+             "not a clean arm.";
+#endif
     if (alpha == 0.0) {
       if (computed == 0)
         return "alpha = 0 and the smoother computed a correction on ZERO of " +

@@ -57,7 +57,28 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
   this->smoother_kf_refused_ = 0;
   this->smoother_submap_dirty_ = false;
   this->raw_imu_n_ = 0;
-  this->raw_imu_keep_s_ = this->smoother_params_.lag_s + 5.0;
+  this->raw_imu_lead_s_ = 0.0;
+  // HOW FAR BACK THE RAW TAP IS KEPT, and it is not lag_s + a margin.
+  //
+  // MEASURED, E4 increment 2. lag_s + 5 s was sized against the WINDOW. It is
+  // the wrong quantity: what has to be covered is how far the SCAN pipeline is
+  // running behind the IMU stream, and on a contended box that is unbounded.
+  // On an increment-2 bench with five containers sharing 24 cores the solve
+  // reached 92 ms p50, DLIO fell more than 10 s behind the player, and the tap
+  // ran DRY -- `imu_n=0` on 31 % of Sandbar's scans and 82 % of one big-bag
+  // arm's -- while `ncorr` stayed at 20,000. The smoother then integrated ONE
+  // step at the nearest sample per scan (the declared fallback), its velocity
+  // and attitude went wrong, and the correction climbed 1.8 mm -> 6 m in
+  // eleven scans on the cleanest control bag in the set. Nothing in the
+  // trajectory said so; the run looked like an estimator failure and was not.
+  //
+  // 120 s is not a fitted band: it is "longer than any plausible pipeline
+  // backlog", it costs 640 Hz x 120 s x 56 B = 4.3 MB, and the clause below
+  // makes a tap that runs dry anyway a HARD ERROR rather than a silent
+  // one-step integration.
+  ros::param::param<double>("~dlio/smoother/raw_imu_keep_s",
+                            this->raw_imu_keep_s_,
+                            std::max(120.0, this->smoother_params_.lag_s + 5.0));
   this->kf_sink_.reset(new dlio::OdomNode::KfSink(this));
   if (this->smoother_params_.enabled) {
     this->smoother_.reset(new dlio::smoother::Smoother(this->smoother_params_));
@@ -394,7 +415,7 @@ dlio::OdomNode::~OdomNode() {
            "exceptions=%ld reseats=%ld kf_applied=%ld kf_refused=%ld raw_imu=%ld "
            "solve_ms p50=%.3f p95=%.3f p99=%.3f max=%.3f mean=%.3f "
            "budget_100ms_exceeded=%ld verdict=%s floored=%ld "
-           "anchored=%ld standing=%ld measured=%ld "
+           "anchored=%ld standing=%ld measured=%ld imu_dry=%ld "
            "units=solve_ms:ms;budget:scans_whose_solve_exceeded_the_100_ms_"
            "scan_period_ALSO_DERIVABLE_PER_SCAN_FROM_solve_ms_because_THIS_"
            "LINE_IS_PRINTED_FROM_THE_DESTRUCTOR_AND_A_SIGKILL_NEVER_REACHES_IT;"
@@ -414,7 +435,8 @@ dlio::OdomNode::~OdomNode() {
                                [](double x) { return x > 100.0; }),
            viol.empty() ? "OK" : "SILENT-NO-OP",
            this->smoother_ledger_.floored, this->smoother_ledger_.anchored,
-           this->smoother_ledger_.standing, this->smoother_ledger_.measured);
+           this->smoother_ledger_.standing, this->smoother_ledger_.measured,
+           this->smoother_ledger_.imu_dry);
     fflush(stdout);
   }
 }
@@ -2337,9 +2359,19 @@ void dlio::OdomNode::smootherUpdate() {
         in.imu.push_back(sm);
       }
     }
+    // THE PIPELINE BACKLOG, recorded whether or not the interval had samples.
+    // If the tap has run dry, in.imu is EMPTY and the smoother cannot compute
+    // this from what it was handed -- so it is measured here, from the newest
+    // sample the buffer holds, and put on the [SMOOTH] line. It is the number
+    // that says WHY a scan came up dry: when it exceeds raw_imu_keep_s the
+    // interval's own samples have already been evicted.
+    this->raw_imu_lead_s_ = this->raw_imu_buffer_.empty()
+                                ? 0.0
+                                : (this->raw_imu_buffer_.back().stamp - in.stamp);
   }
 
   this->smoother_sol_ = this->smoother_->update(in);
+  if (in.imu.empty()) this->smoother_sol_.imu_lead_s = this->raw_imu_lead_s_;
   ++this->smoother_scans_;
   this->smoother_solve_ms_.push_back(this->smoother_sol_.solve_ms);
   if (this->smoother_sol_.solve_ms > this->smoother_solve_ms_max_) {
@@ -2416,6 +2448,7 @@ void dlio::OdomNode::logSmoother() {
            "s_rot=%.9g s_trans=%.9g "
            "n=%ld computed=%ld applied=%ld kf_applied=%ld kf_refused=%ld "
            "tgt_m=%.6f tgt_deg=%.6f anch_k=%ld anch_m=%.6f anch_deg=%.6f "
+           "imu_lead=%.3f imu_dry=%ld "
            "reanch=%d incmode=%d standing=%ld measured=%ld "
            "units=solve_ms:ms;corr_m:m;corr_deg:deg;app_m:m;app_deg:deg;"
            "mcov:VARIANCE_diag_of_the_marginal_on_X_k_in_gtsam_Pose3_tangent_"
@@ -2456,7 +2489,7 @@ void dlio::OdomNode::logSmoother() {
            this->smoother_ledger_.applied,
            (long)this->smoother_kf_applied_, (long)this->smoother_kf_refused_,
            W.target_m, W.target_deg, (long)S.anchor_key, S.anchor_resid_m,
-           S.anchor_resid_deg, (int)this->smoother_params_.reanchor,
+           S.anchor_resid_deg, S.imu_lead_s, this->smoother_ledger_.imu_dry, (int)this->smoother_params_.reanchor,
            (int)this->smoother_params_.blend_increment,
            this->smoother_ledger_.standing, this->smoother_ledger_.measured);
     fflush(stdout);
